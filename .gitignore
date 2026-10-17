@@ -1,2 +1,11 @@
 /bin/
 /dist/
+
+# OS and editor junk
+.DS_Store
+
+# Never commit secrets or local environment
+.env
+.env.*
+*.key
+*.pem
