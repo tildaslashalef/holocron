@@ -204,3 +204,7 @@ make release V=X.Y.Z    # tag vX.Y.Z and push it; GitHub builds and publishes
 
 Commits go straight to `main`. A release is only ever built by GitHub
 Actions from the tag ([SPEC.md § 11](SPEC.md#11-build-dependencies-and-releases)).
+
+## License
+
+[MIT](LICENSE).
