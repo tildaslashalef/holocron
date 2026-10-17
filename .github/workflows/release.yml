@@ -1,0 +1,56 @@
+# An annotated vX.Y.Z tag (make release) publishes a release: the checks,
+# static Linux binaries for amd64 and arm64, and SHA256SUMS. The notes are
+# the tag's message and the commit subjects since the previous tag.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      - name: The tag is vX.Y.Z and annotated
+        run: |
+          tag="$GITHUB_REF_NAME"
+          printf '%s' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$' || { echo "::error::$tag is not vX.Y.Z"; exit 1; }
+          # The checkout may store the tag as lightweight; fetch the tag object itself.
+          git fetch -q --force origin "refs/tags/$tag:refs/tags/$tag"
+          [ "$(git cat-file -t "$tag")" = tag ] || { echo "::error::$tag is not an annotated tag"; exit 1; }
+
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - run: make check
+
+      - run: make dist VERSION="${GITHUB_REF_NAME#v}"
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="$GITHUB_REF_NAME"
+          prev=$(git describe --tags --abbrev=0 "$tag^" 2>/dev/null || true)
+          {
+            git tag -l --format='%(contents:subject)' "$tag"
+            git tag -l --format='%(contents:body)' "$tag"
+            echo
+            echo "## Changes"
+            echo
+            git log --no-merges --pretty='- %s' "${prev:+$prev..}$tag"
+          } > "$RUNNER_TEMP/notes.md"
+          gh release create "$tag" dist/* --verify-tag \
+            --title "holocron $tag" --notes-file "$RUNNER_TEMP/notes.md"

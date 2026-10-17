@@ -1,0 +1,25 @@
+# SearXNG for holocron, written by `holocron install` (SPEC.md § 9.1).
+# Changes here are overwritten on the next install.
+[Unit]
+Description=SearXNG, holocron's search provider
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+Image={{.Image}}
+ContainerName=searxng
+# The host firewall sees SearXNG's egress like any process's.
+Network=host
+Environment=GRANIAN_HOST=127.0.0.1
+Environment=SEARXNG_PORT=8888
+Environment=SEARXNG_BASE_URL=http://127.0.0.1:8888/
+# The image's entrypoint owns both as its searxng user (uid 977).
+Volume=/etc/searxng:/etc/searxng:Z
+Volume=/var/cache/searxng:/var/cache/searxng:Z
+NoNewPrivileges=true
+
+[Service]
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

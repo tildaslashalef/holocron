@@ -1,0 +1,45 @@
+# holocron, written by `holocron install` (SPEC.md § 9.2). Changes here
+# are overwritten on the next install.
+[Unit]
+Description=holocron: web search and page fetch for AI agents
+Wants=network-online.target searxng.service
+After=network-online.target searxng.service
+
+[Service]
+User=holocron
+Group=holocron
+# All addresses: the deployment's firewall decides who reaches it.
+{{- if .Brave}}
+# Brave's key, present on this host when this unit was written (SPEC.md
+# § 9 step 3): systemd copies it where only this service reads it.
+LoadCredential=brave-key:{{.KeyPath}}
+ExecStart=/usr/local/bin/holocron serve --listen 0.0.0.0:8080 --provider brave,searxng --brave-key-file ${CREDENTIALS_DIRECTORY}/brave-key
+{{- else}}
+ExecStart=/usr/local/bin/holocron serve --listen 0.0.0.0:8080
+{{- end}}
+Restart=on-failure
+RestartSec=2s
+MemoryMax=1G
+Environment=GOMEMLIMIT=800MiB
+TasksMax=64
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,54 @@
+# SearXNG settings for holocron, written by `holocron install` (SPEC.md
+# § 9.1). Changes here are overwritten on the next install; the secret key
+# is kept.
+use_default_settings:
+  engines:
+    keep_only:
+      - brave
+      - duckduckgo
+      - mojeek
+      - startpage
+      - wikipedia
+      - github
+      - stackoverflow
+      - askubuntu
+      - superuser
+      - mdn
+      - pypi
+      - crates.io
+      - npm
+      - pkg.go.dev
+      - docker hub
+      - arch linux wiki
+
+general:
+  instance_name: holocron
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  formats:
+    - html
+    - json
+
+server:
+  secret_key: "{{.SecretKey}}"
+  limiter: false
+  public_instance: false
+  image_proxy: false
+
+outgoing:
+  request_timeout: 4.0
+  max_request_timeout: 8.0
+
+engines:
+  - name: mojeek
+    inactive: false
+  - name: startpage
+    inactive: false
+  - name: crates.io
+    disabled: false
+  - name: npm
+    disabled: false
+  - name: pkg.go.dev
+    disabled: false
