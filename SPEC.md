@@ -483,7 +483,7 @@ line and the error message.
    443. These are `bad_request` (scheme, credentials, port) or
    `blocked_address` (names, literal addresses). The host is checked before
    the port so a private target is named as one whatever its port
-   (§12's `http://192.168.1.20:8006/`).
+   (§12's `http://192.168.1.20:8443/`).
 2. **At connect time**, in the dialer's `Control` hook (`net.Dialer`),
    which sees the exact address about to be connected for every attempt,
    including each address Go's dual-stack dialing tries and every redirect:
@@ -991,8 +991,8 @@ Against a running server, one line per check, non-zero exit if any fails:
    its bound; `n=20` clamped to 10; `q=` empty → `bad_request`.
 3. `/v1/fetch` of PEP 8 with `max_chars=2000` → 2,000 characters starting
    with a heading, `chars` > 2,000, `truncated`; `start=2000` pages on.
-4. Guard, each → `blocked_address`: `http://192.168.1.20:8006/`,
-   `http://nas.home.arpa:8006/`, `http://127.0.0.1:8888/`,
+4. Guard, each → `blocked_address`: `http://192.168.1.20:8443/`,
+   `http://nas.home.arpa:8443/`, `http://127.0.0.1:8888/`,
    `http://192.168.1.1.nip.io/`, and a public redirect to
    `http://192.168.1.1/` (`https://httpbin.org/redirect-to?url=…`).
 5. A PDF → `unsupported_content`; a 404 → `upstream_failed`; port 8443 →

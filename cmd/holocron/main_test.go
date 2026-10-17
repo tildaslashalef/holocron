@@ -23,7 +23,7 @@ func TestRun(t *testing.T) {
 		{[]string{"fetch"}, 2, "", "fetch needs one URL"},
 		{[]string{"fetch", "a", "b"}, 2, "", "fetch needs one URL"},
 		{[]string{"fetch", "--bogus", "x"}, 2, "", "flag provided but not defined"},
-		{[]string{"fetch", "http://192.168.1.20:8006/"}, 1, "", "blocked_address: 192.168.1.20 is not a public address"},
+		{[]string{"fetch", "http://192.168.1.20:8443/"}, 1, "", "blocked_address: 192.168.1.20 is not a public address"},
 		{[]string{"fetch", "http://nas/", "--text"}, 1, "", "blocked_address"},
 		{[]string{"fetch", "https://example.org:8443/"}, 1, "", "bad_request"},
 		{[]string{"fetch", "--max-chars", "0", "https://example.org/"}, 2, "", "--max-chars"},

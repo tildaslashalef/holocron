@@ -248,8 +248,8 @@ func TestFetch(t *testing.T) {
 	h.wantError(t, "/v1/fetch?url=https://example.org:8443/", 400, "bad_request")
 	h.wantError(t, "/v1/fetch?url=https://example.org/&start=-1", 400, "bad_request")
 	h.wantError(t, "/v1/fetch?url=https://example.org/&max_chars=0", 400, "bad_request")
-	h.wantError(t, "/v1/fetch?url=http://192.168.1.20:8006/", 403, "blocked_address")
-	h.wantError(t, "/v1/fetch?url=http://nas.home.arpa:8006/", 403, "blocked_address")
+	h.wantError(t, "/v1/fetch?url=http://192.168.1.20:8443/", 403, "blocked_address")
+	h.wantError(t, "/v1/fetch?url=http://nas.home.arpa:8443/", 403, "blocked_address")
 }
 
 func TestFetchErrors(t *testing.T) {

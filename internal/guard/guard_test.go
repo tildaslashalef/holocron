@@ -76,7 +76,7 @@ func TestCheckURL(t *testing.T) {
 		{"http://app.localhost/", blocked},
 		{"http://printer.local/", blocked},
 		{"http://metadata.google.internal/", blocked},
-		{"http://nas.home.arpa:8006/", blocked}, // the host before the port
+		{"http://nas.home.arpa:8443/", blocked}, // the host before the port
 		{"http://router.lan/", blocked},
 		{"http://box.tail1234.ts.net/", blocked},
 		{"http://ts.net/", blocked},
@@ -84,7 +84,7 @@ func TestCheckURL(t *testing.T) {
 		{"http://2130706433/", blocked},
 		{"http://127.0.0.1/", blocked},
 		{"http://127.0.0.1:8888/", blocked},
-		{"http://192.168.1.20:8006/", blocked},
+		{"http://192.168.1.20:8443/", blocked},
 		{"http://[::1]/", blocked},
 		{"http://[::ffff:127.0.0.1]/", blocked},
 		{"http://[fe80::1%25en0]/", blocked},

@@ -30,8 +30,8 @@ const (
 
 // Blocked are the guard's cases, each answered blocked_address.
 var Blocked = []string{
-	"http://192.168.1.20:8006/",
-	"http://nas.home.arpa:8006/",
+	"http://192.168.1.20:8443/",
+	"http://nas.home.arpa:8443/",
 	"http://127.0.0.1:8888/",
 	"http://192.168.1.1.nip.io/",
 	RedirectSite,
