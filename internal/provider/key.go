@@ -30,13 +30,19 @@ func KeyFile(name, flag string) string {
 // ReadKey reads a key from path: one line, trimmed, not empty. A regular
 // file that its group or others can read is refused, as ssh refuses a
 // private key; a pipe (a shell's process substitution) is read as it is.
-// The error never quotes the file's content.
+// A credential systemd delivered may be readable by its group: systemd
+// makes it 0440 in a directory only this service can open, so there only
+// others are refused. The error never quotes the file's content.
 func ReadKey(name, path string) (string, error) {
 	fi, err := os.Stat(path)
 	if err != nil {
 		return "", fmt.Errorf("%s: the key file: %w", name, err)
 	}
-	if fi.Mode().IsRegular() && fi.Mode().Perm()&0o077 != 0 {
+	refused := fs.FileMode(0o077)
+	if inCredentials(path) {
+		refused = 0o007
+	}
+	if fi.Mode().IsRegular() && fi.Mode().Perm()&refused != 0 {
 		return "", fmt.Errorf("%s: %s is readable by others (mode %04o); chmod 600 it", name, path, fi.Mode().Perm())
 	}
 	if fi.IsDir() {
@@ -54,4 +60,14 @@ func ReadKey(name, path string) (string, error) {
 		return "", fmt.Errorf("%s: %s does not hold one key on one line", name, path)
 	}
 	return key, nil
+}
+
+// inCredentials reports whether path is in $CREDENTIALS_DIRECTORY.
+func inCredentials(path string) bool {
+	dir := os.Getenv("CREDENTIALS_DIRECTORY")
+	if dir == "" {
+		return false
+	}
+	rel, err := filepath.Rel(filepath.Clean(dir), filepath.Clean(path))
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) && rel != "."
 }

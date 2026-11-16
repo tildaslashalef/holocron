@@ -640,7 +640,9 @@ What the metered providers (Parallel, Brave) share:
   the provider out (§4). One line, trimmed, not empty. A regular file
   that its group or others can read is refused ("chmod 600 it"), as ssh
   refuses a private key; a pipe (a shell's process substitution) is read
-  as it is. On the host the key is an encrypted credential or a plain
+  as it is. In `$CREDENTIALS_DIRECTORY` only others are refused: systemd
+  delivers a credential with mode 0440 in a directory only the service
+  can open. On the host the key is an encrypted credential or a plain
   0600 file, put there by `holocron key set` (§9.4). The key is sent only
   in its provider's header (`x-api-key`, `X-Subscription-Token`); never in
   a flag value, the environment, a log line or an error message, which

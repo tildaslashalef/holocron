@@ -194,4 +194,21 @@ func TestKeys(t *testing.T) {
 	if KeyFile("brave", "") != filepath.Join(dir, "brave-key") || KeyFile("parallel", "") != "" || KeyFile("parallel", "/x") != "/x" {
 		t.Error("KeyFile")
 	}
+	// systemd delivers a credential 0440 in a directory only the service
+	// opens: its group may read it there, others never.
+	cred := filepath.Join(dir, "parallel-key")
+	os.WriteFile(cred, []byte("sk-cred\n"), 0o440)
+	if k, err := ReadKey("parallel", cred); err != nil || k != "sk-cred" {
+		t.Errorf("credential 0440: %q %v", k, err)
+	}
+	os.Chmod(cred, 0o444)
+	if _, err := ReadKey("parallel", cred); err == nil {
+		t.Error("a credential others can read")
+	}
+	// The same mode outside the directory is refused.
+	outside := filepath.Join(t.TempDir(), "k")
+	os.WriteFile(outside, []byte("sk\n"), 0o440)
+	if _, err := ReadKey("parallel", outside); err == nil {
+		t.Error("0440 outside the credentials directory")
+	}
 }
