@@ -1019,7 +1019,9 @@ and neither is part of the client contract.
   server, queries and URLs above all, goes in as text, never as markup.
   It reads `/v1/stats` every 5 s, not while the page is hidden, and once
   more when it is shown again.
-- **Try the API**: a form on the page calls `/v1/search`, `/v1/context`
+- **Two views**, chosen by the URL's hash: Metrics (`#metrics`, the
+  default) and Try the API (`#try`).
+- **Try the API**: a form calls `/v1/search`, `/v1/context`
   or `/v1/fetch` from the browser, as a client would, and shows the
   answer rendered or as JSON, with its status, time, `X-Search-Cache`,
   the provider and `providers_failed`, a curl line to copy, and the next

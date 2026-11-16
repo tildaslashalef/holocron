@@ -22,8 +22,64 @@
 </header>
 
 <main>
+  <div class="bar-top">
+  <nav class="views" role="tablist" aria-label="View">
+    <a class="view-tab" role="tab" href="#metrics" id="tab-metrics" aria-controls="view-metrics">Metrics</a>
+    <a class="view-tab" role="tab" href="#try" id="tab-try" aria-controls="view-try">Try the API</a>
+  </nav>
   <section class="routes" id="routes" aria-label="Routes"></section>
+  </div>
 
+  <div class="view" id="view-metrics" role="tabpanel" aria-labelledby="tab-metrics">
+  <section class="kpis" id="kpis" aria-label="Last 24 hours"></section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Traffic</h2>
+      <div class="legend" id="legend"></div>
+    </div>
+    <div class="chart" id="chart">
+      <div class="tip" id="tip" hidden></div>
+    </div>
+    <div class="axis" id="axis"></div>
+  </section>
+
+  <section aria-label="Providers">
+    <h2 class="section-title">Providers</h2>
+    <div class="providers" id="providers"></div>
+  </section>
+
+  <div class="grid-2">
+    <section class="panel">
+      <h2>Endpoints</h2>
+      <table class="table" id="endpoints">
+        <thead><tr><th>Endpoint</th><th class="num">Requests</th><th class="num">Errors</th><th class="num">Cache</th><th class="num">p50</th><th class="num">p95</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="codes" id="codes"></div>
+    </section>
+    <section class="panel">
+      <h2>Cache &amp; capacity</h2>
+      <div id="cache"></div>
+      <div id="capacity"></div>
+    </section>
+  </div>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Recent requests</h2>
+      <span class="hint" id="recent-hint"></span>
+    </div>
+    <div class="table-wrap">
+      <table class="table recent" id="recent">
+        <thead><tr><th>When</th><th>Endpoint</th><th>Query or page</th><th>Answered by</th><th>Cache</th><th class="num">Result</th><th class="num">Time</th><th class="num">Cost</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+  </div>
+
+  <div class="view" id="view-try" role="tabpanel" aria-labelledby="tab-try" hidden>
   <section class="panel play" aria-labelledby="play-h">
     <div class="panel-head">
       <div>
@@ -76,53 +132,7 @@
     </form>
     <div class="play-out" id="play-out" aria-live="polite"></div>
   </section>
-
-  <section class="kpis" id="kpis" aria-label="Last 24 hours"></section>
-
-  <section class="panel">
-    <div class="panel-head">
-      <h2>Traffic</h2>
-      <div class="legend" id="legend"></div>
-    </div>
-    <div class="chart" id="chart">
-      <div class="tip" id="tip" hidden></div>
-    </div>
-    <div class="axis" id="axis"></div>
-  </section>
-
-  <section aria-label="Providers">
-    <h2 class="section-title">Providers</h2>
-    <div class="providers" id="providers"></div>
-  </section>
-
-  <div class="grid-2">
-    <section class="panel">
-      <h2>Endpoints</h2>
-      <table class="table" id="endpoints">
-        <thead><tr><th>Endpoint</th><th class="num">Requests</th><th class="num">Errors</th><th class="num">Cache</th><th class="num">p50</th><th class="num">p95</th></tr></thead>
-        <tbody></tbody>
-      </table>
-      <div class="codes" id="codes"></div>
-    </section>
-    <section class="panel">
-      <h2>Cache &amp; capacity</h2>
-      <div id="cache"></div>
-      <div id="capacity"></div>
-    </section>
   </div>
-
-  <section class="panel">
-    <div class="panel-head">
-      <h2>Recent requests</h2>
-      <span class="hint" id="recent-hint"></span>
-    </div>
-    <div class="table-wrap">
-      <table class="table recent" id="recent">
-        <thead><tr><th>When</th><th>Endpoint</th><th>Query or page</th><th>Answered by</th><th>Cache</th><th class="num">Result</th><th class="num">Time</th><th class="num">Cost</th></tr></thead>
-        <tbody></tbody>
-      </table>
-    </div>
-  </section>
 </main>
 
 <footer class="foot">

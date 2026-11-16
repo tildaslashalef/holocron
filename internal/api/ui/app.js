@@ -472,6 +472,32 @@
     return h("div", { class: "results" }, head, doc, h("div", { class: "pager" }, pager));
   }
 
+  // The page's two views, Metrics and Try the API, follow the URL's hash,
+  // so a reload or a shared link opens the same one.
+  function setupViews() {
+    window.addEventListener("hashchange", showView);
+    document.querySelector(".views").addEventListener("keydown", (ev) => {
+      if (ev.key !== "ArrowRight" && ev.key !== "ArrowLeft") return;
+      const next = location.hash === "#try" ? "#metrics" : "#try";
+      history.replaceState(null, "", next);
+      showView();
+      $(next === "#try" ? "tab-try" : "tab-metrics").focus();
+    });
+    showView();
+  }
+  function showView() {
+    const tryIt = location.hash === "#try";
+    $("view-metrics").hidden = tryIt;
+    $("view-try").hidden = !tryIt;
+    document.querySelector(".foot").hidden = tryIt;
+    for (const [id, on] of [["tab-metrics", !tryIt], ["tab-try", tryIt]]) {
+      $(id).setAttribute("aria-selected", on ? "true" : "false");
+      $(id).tabIndex = on ? 0 : -1;
+    }
+    if (tryIt) (play.ep === "fetch" ? $("p-url") : $("p-q")).focus({ preventScroll: true });
+    else if (last) render(last); // a chart drawn while hidden has no width
+  }
+
   let last = null;
   let failures = 0;
   function render(d) {
@@ -506,4 +532,5 @@
   setInterval(tick, REFRESH_MS);
   document.addEventListener("visibilitychange", () => { if (!document.hidden) tick(); });
   setupPlayground();
+  setupViews();
 })();

@@ -66,6 +66,17 @@ h2 { font-size: 15px; font-weight: 650; }
 
 main { display: flex; flex-direction: column; gap: 20px; padding-top: 12px; padding-bottom: 24px; }
 
+.bar-top { display: flex; align-items: center; justify-content: space-between; gap: 14px 20px; flex-wrap: wrap; }
+.views { display: inline-flex; gap: 4px; padding: 4px; border-radius: 12px; background: var(--panel); border: 1px solid var(--line); box-shadow: var(--shadow); }
+.view-tab {
+  text-decoration: none; color: var(--muted); font-weight: 650; font-size: 14px;
+  padding: 8px 18px; border-radius: 9px;
+}
+.view-tab:hover { color: var(--text); background: var(--panel-2); }
+.view-tab[aria-selected="true"] { color: #fff; background: var(--accent); }
+.view-tab:focus-visible { outline: none; box-shadow: var(--ring); }
+.view { display: flex; flex-direction: column; gap: 20px; }
+.view[hidden] { display: none; }
 .routes { display: flex; flex-wrap: wrap; gap: 10px; }
 .route {
   display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
