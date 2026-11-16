@@ -207,7 +207,20 @@ main { display: flex; flex-direction: column; gap: 20px; padding-top: 12px; padd
   border: 1px solid var(--line-2); border-radius: 10px; padding: 9px 12px; min-width: 0;
 }
 .field input { font-size: 14.5px; }
-.field select { padding-right: 28px; }
+.select { position: relative; display: block; }
+.select select {
+  appearance: none; -webkit-appearance: none; width: 100%; cursor: pointer;
+  padding-right: 38px; min-width: 96px;
+}
+.select::after {
+  content: ""; position: absolute; top: 50%; right: 14px; pointer-events: none;
+  width: 7px; height: 7px; margin-top: -6px;
+  border-right: 2px solid var(--muted); border-bottom: 2px solid var(--muted);
+  border-radius: 1px; transform: rotate(45deg); transition: border-color .15s;
+}
+.select:hover::after { border-color: var(--text); }
+.select:focus-within::after { border-color: var(--accent); }
+.select select:hover { border-color: var(--faint); }
 .field input:focus, .field select:focus { outline: none; border-color: var(--accent); box-shadow: var(--ring); }
 .options { display: flex; flex-wrap: wrap; align-items: flex-end; gap: 12px; }
 .check { display: inline-flex; align-items: center; gap: 7px; font-size: 13px; color: var(--muted); padding-bottom: 9px; cursor: pointer; }

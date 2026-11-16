@@ -52,23 +52,23 @@
       <div class="options">
         <div class="field" data-for="search">
           <label for="p-n">Results</label>
-          <select id="p-n"><option>3</option><option selected>5</option><option>8</option><option>10</option></select>
+          <span class="select"><select id="p-n"><option>3</option><option selected>5</option><option>8</option><option>10</option></select></span>
         </div>
         <div class="field" data-for="context" hidden>
           <label for="p-tokens">Tokens</label>
-          <select id="p-tokens"><option>1024</option><option selected>2048</option><option>4096</option><option>8192</option></select>
+          <span class="select"><select id="p-tokens"><option>1024</option><option selected>2048</option><option>4096</option><option>8192</option></select></span>
         </div>
         <div class="field" data-for="context" hidden>
           <label for="p-urls">Pages</label>
-          <select id="p-urls"><option>4</option><option selected>8</option><option>12</option><option>20</option></select>
+          <span class="select"><select id="p-urls"><option>4</option><option selected>8</option><option>12</option><option>20</option></select></span>
         </div>
         <div class="field" data-for="search context">
           <label for="p-fresh">Freshness</label>
-          <select id="p-fresh"><option value="">any time</option><option value="pd">past day</option><option value="pw">past week</option><option value="pm">past month</option><option value="py">past year</option></select>
+          <span class="select"><select id="p-fresh"><option value="">any time</option><option value="pd">past day</option><option value="pw">past week</option><option value="pm">past month</option><option value="py">past year</option></select></span>
         </div>
         <div class="field" data-for="fetch" hidden>
           <label for="p-max">Characters</label>
-          <select id="p-max"><option>2000</option><option selected>8000</option><option>20000</option><option>50000</option></select>
+          <span class="select"><select id="p-max"><option>2000</option><option selected>8000</option><option>20000</option><option>50000</option></select></span>
         </div>
         <label class="check"><input id="p-fresh-cache" type="checkbox"> Skip the cache</label>
         <button class="go" id="p-go" type="submit">Search</button>
