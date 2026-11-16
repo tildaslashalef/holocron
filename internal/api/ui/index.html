@@ -24,6 +24,59 @@
 <main>
   <section class="routes" id="routes" aria-label="Routes"></section>
 
+  <section class="panel play" aria-labelledby="play-h">
+    <div class="panel-head">
+      <div>
+        <h2 id="play-h">Try the API</h2>
+        <p class="hint">Calls this server's <code>/v1</code> from your browser, as an agent would. An answer that is not cached is billed by the provider that gives it.</p>
+      </div>
+      <div class="tabs" role="tablist" aria-label="Endpoint">
+        <button type="button" role="tab" class="tab" data-ep="search" aria-selected="true">Search</button>
+        <button type="button" role="tab" class="tab" data-ep="context" aria-selected="false">Context</button>
+        <button type="button" role="tab" class="tab" data-ep="fetch" aria-selected="false">Fetch</button>
+      </div>
+    </div>
+    <form class="play-form" id="play-form" autocomplete="off" novalidate>
+      <div class="field grow" data-for="search context">
+        <label for="p-q">Query</label>
+        <input id="p-q" type="search" maxlength="400" placeholder="zig std.http.Client proxy support" spellcheck="false">
+      </div>
+      <div class="field grow" data-for="fetch" hidden>
+        <label for="p-url">URL</label>
+        <input id="p-url" type="url" maxlength="2048" placeholder="https://peps.python.org/pep-0008/" spellcheck="false">
+      </div>
+      <div class="field grow" data-for="fetch" hidden>
+        <label for="p-focus">Question <span class="opt">optional: only the parts that answer it</span></label>
+        <input id="p-focus" type="text" maxlength="400" placeholder="maximum line length" spellcheck="false">
+      </div>
+      <div class="options">
+        <div class="field" data-for="search">
+          <label for="p-n">Results</label>
+          <select id="p-n"><option>3</option><option selected>5</option><option>8</option><option>10</option></select>
+        </div>
+        <div class="field" data-for="context" hidden>
+          <label for="p-tokens">Tokens</label>
+          <select id="p-tokens"><option>1024</option><option selected>2048</option><option>4096</option><option>8192</option></select>
+        </div>
+        <div class="field" data-for="context" hidden>
+          <label for="p-urls">Pages</label>
+          <select id="p-urls"><option>4</option><option selected>8</option><option>12</option><option>20</option></select>
+        </div>
+        <div class="field" data-for="search context">
+          <label for="p-fresh">Freshness</label>
+          <select id="p-fresh"><option value="">any time</option><option value="pd">past day</option><option value="pw">past week</option><option value="pm">past month</option><option value="py">past year</option></select>
+        </div>
+        <div class="field" data-for="fetch" hidden>
+          <label for="p-max">Characters</label>
+          <select id="p-max"><option>2000</option><option selected>8000</option><option>20000</option><option>50000</option></select>
+        </div>
+        <label class="check"><input id="p-fresh-cache" type="checkbox"> Skip the cache</label>
+        <button class="go" id="p-go" type="submit">Search</button>
+      </div>
+    </form>
+    <div class="play-out" id="play-out" aria-live="polite"></div>
+  </section>
+
   <section class="kpis" id="kpis" aria-label="Last 24 hours"></section>
 
   <section class="panel">

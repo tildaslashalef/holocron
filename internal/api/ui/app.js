@@ -299,6 +299,179 @@
     fill(body, rows);
   }
 
+
+  // --- Try the API ---------------------------------------------------------
+  // The playground calls /v1 like an agent would and shows the answer
+  // rendered or raw. Like the rest of the page, every value goes in as
+  // text; a link is made only for an http(s) URL.
+
+  function safeURL(u) {
+    try {
+      const p = new URL(u);
+      return p.protocol === "http:" || p.protocol === "https:" ? p.href : null;
+    } catch (e) { return null; }
+  }
+  function link(u, cls, label) {
+    const href = safeURL(u);
+    return href ? h("a", { class: cls, href, target: "_blank", rel: "noopener noreferrer" }, label || u) : h("span", { class: cls }, label || u);
+  }
+
+  const play = { ep: "search", raw: false, last: null };
+
+  function setupPlayground() {
+    const form = $("play-form");
+    document.querySelectorAll(".tab").forEach((t) => t.addEventListener("click", () => selectTab(t.dataset.ep, true)));
+    document.querySelector(".tabs").addEventListener("keydown", (ev) => {
+      if (ev.key !== "ArrowRight" && ev.key !== "ArrowLeft") return;
+      const order = ["search", "context", "fetch"];
+      const i = (order.indexOf(play.ep) + (ev.key === "ArrowRight" ? 1 : 2)) % 3;
+      selectTab(order[i], true);
+      document.querySelector('.tab[data-ep="' + order[i] + '"]').focus();
+    });
+    form.addEventListener("submit", (ev) => { ev.preventDefault(); run(0); });
+    selectTab("search", false);
+  }
+
+  function selectTab(ep, focus) {
+    play.ep = ep;
+    document.querySelectorAll(".tab").forEach((t) => {
+      const on = t.dataset.ep === ep;
+      t.setAttribute("aria-selected", on ? "true" : "false");
+      t.tabIndex = on ? 0 : -1;
+    });
+    document.querySelectorAll("#play-form [data-for]").forEach((f) => { f.hidden = !f.dataset.for.split(" ").includes(ep); });
+    $("p-go").textContent = { search: "Search", context: "Get context", fetch: "Fetch" }[ep];
+    if (focus) (ep === "fetch" ? $("p-url") : $("p-q")).focus();
+  }
+
+  function buildPath(start) {
+    const p = new URLSearchParams();
+    const fresh = $("p-fresh").value;
+    if (play.ep === "fetch") {
+      p.set("url", $("p-url").value.trim());
+      const focus = $("p-focus").value.trim();
+      if (focus) p.set("q", focus);
+      if (start) p.set("start", String(start));
+      p.set("max_chars", $("p-max").value);
+    } else {
+      p.set("q", $("p-q").value.trim());
+      if (play.ep === "search") p.set("n", $("p-n").value);
+      else { p.set("tokens", $("p-tokens").value); p.set("urls", $("p-urls").value); }
+      if (fresh) p.set("freshness", fresh);
+    }
+    return "/v1/" + play.ep + "?" + p.toString();
+  }
+
+  async function run(start) {
+    const out = $("play-out");
+    const needed = play.ep === "fetch" ? $("p-url") : $("p-q");
+    if (!needed.value.trim()) { needed.focus(); return; }
+    const path = buildPath(start);
+    const noCache = $("p-fresh-cache").checked;
+    const go = $("p-go");
+    go.disabled = true;
+    fill(out, h("div", { class: "req" }, h("span", { class: "line" }, "GET " + path), h("span", {}, "waiting…")));
+    const t0 = performance.now();
+    let res, body, text;
+    try {
+      res = await fetch(path, { headers: Object.assign({ Accept: "application/json" }, noCache ? { "Cache-Control": "no-cache" } : {}) });
+      text = await res.text();
+      try { body = JSON.parse(text); } catch (e) { body = null; }
+    } catch (e) {
+      go.disabled = false;
+      fill(out, h("div", { class: "problem" }, h("b", {}, "unreachable"), String(e.message || e)));
+      return;
+    }
+    go.disabled = false;
+    play.last = { ep: play.ep, path, status: res.status, ms: performance.now() - t0, cache: res.headers.get("X-Search-Cache"), age: res.headers.get("Age"), body, text, start };
+    showResult();
+    setTimeout(tick, 300); // the stats now include this request
+  }
+
+  function showResult() {
+    const r = play.last;
+    const out = $("play-out");
+    const b = r.body || {};
+    const chips = [h("span", { class: "chip " + (r.status < 400 ? "ok" : "bad") }, String(r.status)), h("span", { class: "chip" }, ms(r.ms))];
+    if (r.cache) chips.push(h("span", { class: "chip " + (r.cache === "miss" ? "" : "ok") }, "cache " + r.cache + (r.age ? " · " + r.age + " s old" : "")));
+    if (b.provider) chips.push(h("span", { class: "chip acc" }, "by " + b.provider));
+    if (b.providers_failed && b.providers_failed.length) chips.push(h("span", { class: "chip bad" }, "skipped " + b.providers_failed.join(", ")));
+    const curl = "curl -s '" + location.origin + r.path.replace(/'/g, "'\\''") + "'";
+    const copy = h("button", { type: "button", class: "ghost", title: "Copy as a curl command" }, "Copy curl");
+    copy.addEventListener("click", async () => {
+      try { await navigator.clipboard.writeText(curl); copy.textContent = "Copied"; } catch (e) { copy.textContent = "Copy failed"; }
+      setTimeout(() => { copy.textContent = "Copy curl"; }, 1500);
+    });
+    const rawBtn = h("button", { type: "button", class: "ghost", "aria-pressed": play.raw ? "true" : "false" }, "JSON");
+    rawBtn.addEventListener("click", () => { play.raw = !play.raw; showResult(); });
+    const head = h("div", { class: "req" }, h("span", { class: "line" }, "GET " + r.path), h("div", { class: "chips" }, chips), copy, rawBtn);
+
+    let view;
+    if (play.raw) view = h("pre", { class: "raw" }, r.body ? JSON.stringify(r.body, null, 2) : r.text);
+    else if (r.status >= 400 || !r.body) view = h("div", { class: "problem" }, h("b", {}, (b.error && b.error.code) || "error"), (b.error && b.error.message) || r.text || "no answer");
+    else if (r.ep === "search") view = renderSearchResult(b);
+    else if (r.ep === "context") view = renderContextResult(b);
+    else view = renderFetchResult(b);
+    fill(out, head, view);
+  }
+
+  function renderSearchResult(b) {
+    const items = b.results || [];
+    const parts = [];
+    if (b.altered_query) parts.push(h("div", { class: "hint" }, "Searched for: " + b.altered_query));
+    if (!items.length) parts.push(h("div", { class: "empty" }, "No results."));
+    items.forEach((it, i) => parts.push(h("article", { class: "res" },
+      h("div", { class: "res-top" }, h("span", { class: "n" }, String(i + 1)), link(it.url, "title", it.title || it.url),
+        it.published ? h("span", { class: "date" }, it.published) : null),
+      h("div", { class: "url" }, it.url),
+      it.snippet ? h("p", {}, it.snippet) : null,
+      it.snippets && it.snippets.length ? h("details", { class: "more" },
+        h("summary", {}, count(it.snippets.length, "passage", "passages") + " from the page"),
+        h("ul", {}, it.snippets.map((sn) => h("li", {}, sn)))) : null)));
+    return h("div", { class: "results" }, parts);
+  }
+
+  function renderContextResult(b) {
+    const srcs = b.sources || [];
+    let chars = 0;
+    srcs.forEach((sr) => (sr.snippets || []).forEach((sn) => { chars += sn.length; }));
+    const parts = [h("div", { class: "hint" }, count(srcs.length, "source", "sources") + " · about " + num(Math.round(chars / 4)) + " tokens of passages")];
+    if (!srcs.length) parts.push(h("div", { class: "empty" }, "No sources."));
+    srcs.forEach((sr, i) => parts.push(h("article", { class: "res" },
+      h("div", { class: "res-top" }, h("span", { class: "n" }, String(i + 1)), link(sr.url, "title", sr.title || sr.url),
+        sr.published ? h("span", { class: "date" }, sr.published) : null),
+      h("div", { class: "url" }, sr.url),
+      (sr.snippets || []).map((sn) => h("blockquote", {}, sn)))));
+    return h("div", { class: "results" }, parts);
+  }
+
+  function renderFetchResult(b) {
+    const shown = (b.text || "").length;
+    const end = (b.start || 0) + [...(b.text || "")].length;
+    const meta = [];
+    if (b.focused) meta.push(h("span", { class: "chip acc" }, "focused on the question"));
+    if (b.content_type) meta.push(h("span", { class: "chip" }, b.content_type));
+    if (b.status) meta.push(h("span", { class: "chip" }, "page answered " + b.status));
+    if (b.published) meta.push(h("span", { class: "chip" }, "published " + b.published));
+    meta.push(h("span", { class: "chip" }, "characters " + num(b.start || 0) + "–" + num(end) + " of " + num(b.chars)));
+    const head = h("div", { class: "doc-head" },
+      h("span", { class: "t" }, b.title || "(no title)"),
+      link(b.final_url || b.url, "", b.final_url || b.url),
+      h("div", { class: "chips" }, meta));
+    const doc = h("pre", { class: "doc" }, shown ? b.text : "(no text)");
+    const pager = [];
+    if (b.truncated && end < b.chars) {
+      const next = h("button", { type: "button", class: "ghost" }, "Next " + num(Math.min(Number($("p-max").value), b.chars - end)) + " characters");
+      next.addEventListener("click", () => run(end));
+      pager.push(next, h("span", {}, "from the cache: no new upstream call"));
+    } else if (b.truncated) {
+      pager.push(h("span", {}, "The source was cut at the provider's limit; this is all that was read."));
+    } else {
+      pager.push(h("span", {}, "The whole " + (b.focused ? "focused answer" : "page") + "."));
+    }
+    return h("div", { class: "results" }, head, doc, h("div", { class: "pager" }, pager));
+  }
+
   let last = null;
   let failures = 0;
   function render(d) {
@@ -332,5 +505,5 @@
   tick();
   setInterval(tick, REFRESH_MS);
   document.addEventListener("visibilitychange", () => { if (!document.hidden) tick(); });
-  window.matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { if (last) render(last); });
+  setupPlayground();
 })();
