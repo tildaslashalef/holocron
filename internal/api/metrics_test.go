@@ -43,13 +43,13 @@ func wantSamples(t *testing.T, p *metrics.Parsed, want map[string]float64) {
 // scrape is neither logged nor counted.
 func TestMetricsExposition(t *testing.T) {
 	h := newHarness(&fakeProvider{}, nil, true)
-	h.srv.SetSearXNGImage(`docker.io/searxng/searxng@sha256:"odd"`)
 	scrape(t, h)
 	p := scrape(t, h)
 	for family, typ := range map[string]string{
 		"holocron_requests_total": "counter", "holocron_request_duration_seconds": "histogram",
-		"holocron_brave_billed_total": "counter", "holocron_fallbacks_total": "counter",
-		"holocron_engines_failed_total": "counter", "holocron_provider_up": "gauge",
+		"holocron_billed_total": "counter", "holocron_cost_usd_total": "counter",
+		"holocron_cache_saved_usd_total": "counter", "holocron_fallbacks_total": "counter",
+		"holocron_providers_failed_total": "counter", "holocron_provider_up": "gauge",
 		"holocron_cache_entries": "gauge", "holocron_cache_bytes": "gauge", "holocron_cache_lookups_total": "counter",
 		"holocron_slots_in_use": "gauge", "holocron_slots_max": "gauge", "holocron_busy_total": "counter",
 		"holocron_build_info": "gauge", "go_goroutines": "gauge", "go_heap_objects_bytes": "gauge",
@@ -60,13 +60,16 @@ func TestMetricsExposition(t *testing.T) {
 		}
 	}
 	wantSamples(t, p, map[string]float64{
-		`holocron_provider_up{provider="fake"}`: 1,
-		`holocron_cache_entries{kind="fetch"}`:  0,
-		`holocron_slots_max`:                    Slots,
-		`holocron_slots_in_use`:                 0,
-		`holocron_brave_billed_total`:           0,
-		`holocron_busy_total`:                   0,
-		`holocron_build_info{version="1.2.3",goversion="` + runtimeVersion() + `",searxng_image="docker.io/searxng/searxng@sha256:\"odd\""}`: 1,
+		`holocron_provider_up{provider="fake"}`:                                     1,
+		`holocron_provider_up{provider="local"}`:                                    1,
+		`holocron_cache_entries{kind="fetch"}`:                                      0,
+		`holocron_slots_max{pool="upstream"}`:                                       Slots,
+		`holocron_slots_max{pool="extract"}`:                                        ExtractSlots,
+		`holocron_slots_in_use{pool="upstream"}`:                                    0,
+		`holocron_slots_in_use{pool="extract"}`:                                     0,
+		`holocron_cache_saved_usd_total`:                                            0,
+		`holocron_busy_total`:                                                       0,
+		`holocron_build_info{version="1.2.3",goversion="` + runtimeVersion() + `"}`: 1,
 	})
 	if p.Samples["go_goroutines"] < 1 || p.Samples["go_memory_total_bytes"] <= 0 {
 		t.Errorf("runtime: %v %v", p.Samples["go_goroutines"], p.Samples["go_memory_total_bytes"])
@@ -125,14 +128,15 @@ func TestMetricsCountRequests(t *testing.T) {
 	}
 }
 
-// Brave's bill and failed engines count once per call; fallbacks once per
-// request.
-func TestMetricsBraveAndFallbacks(t *testing.T) {
-	brave := &traceProvider{name: "brave", res: results(3), block: make(chan struct{})}
-	searx := &traceProvider{name: "searxng", res: provider.Results{Items: results(2).Items, EnginesFailed: []string{"duckduckgo"}}}
-	h := newHarness(provider.NewChain(brave, searx), nil, true)
+// A metered provider's bill counts once per call, with its cost; a hit
+// counts what it saved; fallbacks count once per request, and failed
+// providers once per call.
+func TestMetricsBillsAndFallbacks(t *testing.T) {
+	par := &traceProvider{name: "parallel", res: results(3), block: make(chan struct{})}
+	brave := &traceProvider{name: "brave", res: results(2)}
+	h := newHarness(provider.NewChain(par, brave), nil, true)
 	h.clock()
-	key := searchKey("brave,searxng", "shared", "")
+	key := searchKey("parallel,brave", "shared", "")
 	var wg sync.WaitGroup
 	for range 3 {
 		wg.Go(func() {
@@ -140,21 +144,28 @@ func TestMetricsBraveAndFallbacks(t *testing.T) {
 		})
 	}
 	waitFor(t, func() bool { return h.srv.cache.searchCalls.Waiting(key) == 3 })
-	close(brave.block)
+	close(par.block)
 	wg.Wait()
+	h.do(t, http.MethodGet, "/v1/search?q=shared", nil) // a hit: saved, not billed
 
-	brave.err = &provider.UnavailableError{Msg: "brave: quota", Reason: provider.ReasonQuota}
+	par.err = &provider.UnavailableError{Msg: "parallel: credit used up", Reason: provider.ReasonQuota}
 	h.do(t, http.MethodGet, "/v1/search?q=fallen", nil)
-	h.do(t, http.MethodGet, "/v1/search?q=fallen", nil) // a hit: no new failed engines
+	h.do(t, http.MethodGet, "/v1/search?q=fallen", nil) // a hit: no new failure
 	h.do(t, http.MethodGet, "/v1/search?q=again", nil)
 	p := scrape(t, h)
 	wantSamples(t, p, map[string]float64{
-		`holocron_brave_billed_total`: 1,
-		`holocron_requests_total{endpoint="/v1/search",code="",cache="miss",answered_by="brave"}`: 3,
-		`holocron_fallbacks_total{provider="brave",reason="quota"}`:                               2,
-		`holocron_engines_failed_total{engine="brave"}`:                                           2,
-		`holocron_engines_failed_total{engine="duckduckgo"}`:                                      2,
-		`holocron_provider_up{provider="brave"}`:                                                  1,
-		`holocron_provider_up{provider="searxng"}`:                                                1,
+		`holocron_billed_total{provider="parallel"}`:                                                 1,
+		`holocron_billed_total{provider="brave"}`:                                                    2,
+		`holocron_cost_usd_total{provider="parallel"}`:                                               0.005,
+		`holocron_cost_usd_total{provider="brave"}`:                                                  0.01,
+		`holocron_requests_total{endpoint="/v1/search",code="",cache="miss",answered_by="parallel"}`: 3,
+		`holocron_requests_total{endpoint="/v1/search",code="",cache="miss",answered_by="brave"}`:    2,
+		`holocron_fallbacks_total{provider="parallel",reason="quota"}`:                               2,
+		`holocron_providers_failed_total{provider="parallel"}`:                                       2,
+		`holocron_provider_up{provider="parallel"}`:                                                  1,
+		`holocron_provider_up{provider="brave"}`:                                                     1,
 	})
+	if saved := p.Samples[`holocron_cache_saved_usd_total`]; saved < 0.0099 || saved > 0.0101 {
+		t.Errorf("saved %v, want 0.01: two hits", saved)
+	}
 }

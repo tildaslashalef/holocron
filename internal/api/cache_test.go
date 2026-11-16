@@ -16,7 +16,6 @@ import (
 	"github.com/tildaslashalef/holocron/internal/fetch"
 	"github.com/tildaslashalef/holocron/internal/guard"
 	"github.com/tildaslashalef/holocron/internal/provider"
-	"github.com/tildaslashalef/holocron/internal/provider/searxng"
 )
 
 // clock is an injected now for the cache.
@@ -46,7 +45,7 @@ func (h harness) clock() *clock {
 func results(n int) provider.Results {
 	var res provider.Results
 	for i := range n {
-		res.Items = append(res.Items, provider.Result{Title: fmt.Sprintf("r%d", i), URL: fmt.Sprintf("https://example.org/%d", i), Engine: "e"})
+		res.Items = append(res.Items, provider.Result{Title: fmt.Sprintf("r%d", i), URL: fmt.Sprintf("https://example.org/%d", i)})
 	}
 	return res
 }
@@ -119,8 +118,10 @@ func TestSearchCacheTTL(t *testing.T) {
 		t.Errorf("%d provider calls, want 2", p.calls.Load())
 	}
 
-	// Engines failed: 5 minutes.
-	p.res.EnginesFailed = []string{"brave"}
+	// A provider failed before the one that answered: 5 minutes.
+	down := namedProvider{&fakeProvider{err: &provider.UnavailableError{Msg: "down"}}, "parallel"}
+	h = newHarness(provider.NewChain(down, p), nil, true)
+	c = h.clock()
 	h.do(t, http.MethodGet, "/v1/search?q=partial", nil)
 	c.add(SearchPartialTTL - time.Second)
 	wantCache(t, h.do(t, http.MethodGet, "/v1/search?q=partial", nil), "hit", "299")
@@ -157,7 +158,8 @@ func TestSearchNoCache(t *testing.T) {
 	}
 }
 
-// An expired search is answered, marked stale, only instead of no_engines,
+// An expired search is answered, marked stale, only instead of
+// provider_unavailable,
 // and only within 24 hours.
 func TestSearchStaleIfError(t *testing.T) {
 	p := &fakeProvider{res: results(3)}
@@ -167,15 +169,11 @@ func TestSearchStaleIfError(t *testing.T) {
 	c.add(time.Hour)
 
 	var s Search
-	p.res, p.err = provider.Results{}, &provider.UnavailableError{Msg: "searxng is unreachable"}
+	p.res, p.err = provider.Results{}, &provider.UnavailableError{Msg: "parallel is unreachable"}
 	wantCache(t, h.do(t, http.MethodGet, "/v1/search?q=X&n=2", &s), "stale", "3600")
 	if len(s.Results) != 2 || s.Query != "X" {
 		t.Errorf("stale: %+v", s)
 	}
-	// No results while engines failed is no_engines too.
-	p.res, p.err = provider.Results{EnginesFailed: []string{"brave", "duckduckgo"}}, nil
-	wantCache(t, h.do(t, http.MethodGet, "/v1/search?q=x", &s), "stale", "3600")
-
 	// Not for another error.
 	p.res, p.err = provider.Results{}, &provider.TimeoutError{Msg: "slow"}
 	wantCache(t, h.do(t, http.MethodGet, "/v1/search?q=x", nil), "miss", "")
@@ -184,30 +182,20 @@ func TestSearchStaleIfError(t *testing.T) {
 	p.err = &provider.UnavailableError{Msg: "down"}
 	resp := h.send(t, refresh("/v1/search?q=x"), nil)
 	if resp.StatusCode != 503 {
-		t.Errorf("no-cache: %d, want no_engines", resp.StatusCode)
+		t.Errorf("no-cache: %d, want provider_unavailable", resp.StatusCode)
 	}
 	// Not past 24 hours.
 	c.add(StaleMax - time.Hour)
-	h.wantError(t, "/v1/search?q=x", 503, "no_engines")
+	h.wantError(t, "/v1/search?q=x", 503, "provider_unavailable")
 }
 
-// Concurrent identical searches share one SearXNG call, even when they
+// Concurrent identical searches share one provider call, even when they
 // skip the lookup.
 func TestSearchSharedCall(t *testing.T) {
-	var calls atomic.Int32
 	release := make(chan struct{})
-	sx := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		calls.Add(1)
-		<-release
-		fmt.Fprint(w, `{"results": [{"url": "https://ziglang.org/", "title": "Zig", "content": "c", "engine": "brave"}], "unresponsive_engines": []}`)
-	}))
-	defer sx.Close()
-	p, err := searxng.New(sx.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
+	p := &fakeProvider{res: results(1), block: release}
 	h := newHarness(p, nil, true)
-	key := searchKey("searxng", "zig", "")
+	key := searchKey("fake", "zig", "")
 	var wg sync.WaitGroup
 	got := make([]Search, 2)
 	for i, q := range []string{"zig", "ZIG"} {
@@ -225,8 +213,8 @@ func TestSearchSharedCall(t *testing.T) {
 	waitFor(t, func() bool { return h.srv.cache.searchCalls.Waiting(key) == 2 })
 	close(release)
 	wg.Wait()
-	if calls.Load() != 1 {
-		t.Errorf("%d SearXNG calls, want 1", calls.Load())
+	if p.calls.Load() != 1 {
+		t.Errorf("%d provider calls, want 1", p.calls.Load())
 	}
 	if got[0].Query != "zig" || got[1].Query != "ZIG" || len(got[1].Results) != 1 {
 		t.Errorf("answers: %+v", got)
@@ -343,7 +331,8 @@ func TestFetchCacheRefusedURL(t *testing.T) {
 	// Entries a refused URL would map to, as if stored by mistake.
 	for _, raw := range []string{"http://192.168.1.20/", "https://example.org:8443/", "http://nas.home.arpa/"} {
 		u, _ := url.Parse(raw)
-		h.srv.cache.pages.Put(fetchKey(u), pageEntry{page: f.page}, 10, h.srv.cache.now(), time.Hour, time.Hour)
+		page := &provider.Page{FinalURL: f.page.FinalURL, Text: f.page.Text}
+		h.srv.cache.pages.Put(pageKey("local", u, ""), pageEntry{page: page}, 10, h.srv.cache.now(), time.Hour, time.Hour)
 	}
 	for _, tt := range []struct {
 		raw    string
@@ -375,7 +364,7 @@ func TestFetchSharedCallOutlivesALeaver(t *testing.T) {
 	release := make(chan struct{})
 	f := &slowFetcher{release: release}
 	h := newHarness(&fakeProvider{}, f, true)
-	key := fetchKey(&url.URL{Scheme: "https", Host: "example.org", Path: "/"})
+	key := pageKey("local", &url.URL{Scheme: "https", Host: "example.org", Path: "/"}, "")
 	ctx, leave := context.WithCancel(context.Background())
 	first := make(chan int, 1)
 	go func() {
@@ -403,6 +392,21 @@ func TestFetchSharedCallOutlivesALeaver(t *testing.T) {
 		t.Errorf("%d fetches", f.calls.Load())
 	}
 	waitFor(t, func() bool { return len(h.srv.slots) == 0 })
+}
+
+// A fetch with q is its own entry, and its answer says it is focused.
+func TestFetchFocusKey(t *testing.T) {
+	f := &fakeFetcher{page: &fetch.Page{FinalURL: "https://example.org/", Status: 200, ContentType: "text/plain", Text: "whole"}}
+	h := newHarness(&fakeProvider{}, f, true)
+	var whole, focused Fetch
+	h.do(t, http.MethodGet, "/v1/fetch?url=https://example.org/", &whole)
+	wantCache(t, h.do(t, http.MethodGet, "/v1/fetch?url=https://example.org/&q=Line+Length", &focused), "miss", "")
+	wantCache(t, h.do(t, http.MethodGet, "/v1/fetch?url=https://example.org/&q=line++length", nil), "hit", "0")
+	// The local provider has no notion of a focus: the whole page, unfocused.
+	if whole.Focused || focused.Focused || focused.Text != "whole" || f.calls.Load() != 2 {
+		t.Errorf("whole %+v focused %+v, %d fetches", whole, focused, f.calls.Load())
+	}
+	h.wantError(t, "/v1/fetch?url=https://example.org/&q="+strings.Repeat("a", MaxFocus+1), 400, "bad_request")
 }
 
 // slowFetcher answers once release closes, or fails when its context

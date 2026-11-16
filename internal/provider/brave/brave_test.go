@@ -92,10 +92,10 @@ func TestSearch(t *testing.T) {
 		t.Errorf("trace quota = %+v", trace.Quotas())
 	}
 	want := []provider.Result{
-		{Title: "Zig's std.http", URL: "https://ziglang.org/a", Snippet: "A & B", ExtraSnippets: []string{"more & more", "again"}, Engine: "brave", Published: "2026-09-01"},
-		{Title: "No date", URL: "https://example.org/b", Snippet: "d", ExtraSnippets: []string{}, Engine: "brave"},
+		{Title: "Zig's std.http", URL: "https://ziglang.org/a", Snippet: "A & B", Snippets: []string{"more & more", "again"}, Published: "2026-09-01"},
+		{Title: "No date", URL: "https://example.org/b", Snippet: "d", Snippets: []string{}},
 	}
-	if !reflect.DeepEqual(res.Items, want) || res.EnginesFailed == nil || res.AlteredQuery != "zig std.http" {
+	if !reflect.DeepEqual(res.Items, want) || res.AlteredQuery != "zig std.http" {
 		t.Errorf("results = %+v", res)
 	}
 	r := h.fake.requests[0]
@@ -332,8 +332,8 @@ func TestPrepaidPlan(t *testing.T) {
 	if _, ok := h.p.Quota(); ok || len(trace.Quotas()) != 0 {
 		t.Errorf("a quota on a plan without a monthly limit: %+v", trace.Quotas())
 	}
-	if h.p.Billed() != 2 || trace.Billed()["brave"] != 2 || !trace.Claim() || trace.Claim() {
-		t.Errorf("billed %d", h.p.Billed())
+	if h.p.Billed() != (provider.Bill{Units: 2, Micros: 10_000}) || trace.Billed()["brave"].Units != 2 || !trace.Claim() || trace.Claim() {
+		t.Errorf("billed %+v", h.p.Billed())
 	}
 	if err := h.p.Health(context.Background()); err != nil {
 		t.Errorf("health: %v", err)

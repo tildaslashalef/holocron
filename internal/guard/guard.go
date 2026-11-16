@@ -162,3 +162,28 @@ func (d *Dialer) DialContext(ctx context.Context, network, address string) (net.
 	}
 	return conn, nil
 }
+
+// CheckHost resolves a URL's host and refuses it unless every address is
+// public: for a URL handed to a provider that fetches it from its own
+// network (§6), so a private name never leaves this one. A literal
+// address was checked by CheckURL already. A failed lookup is returned
+// as the resolver's error.
+func CheckHost(ctx context.Context, resolver *net.Resolver, u *url.URL) error {
+	host := strings.TrimSuffix(strings.ToLower(u.Hostname()), ".")
+	if _, err := netip.ParseAddr(host); err == nil {
+		return nil
+	}
+	if resolver == nil {
+		resolver = &net.Resolver{PreferGo: true}
+	}
+	addrs, err := resolver.LookupNetIP(ctx, "ip", host)
+	if err != nil {
+		return err
+	}
+	for _, a := range addrs {
+		if !Public(a) {
+			return &BlockedError{fmt.Sprintf("%s resolves to %s, not a public address", host, a.Unmap())}
+		}
+	}
+	return nil
+}

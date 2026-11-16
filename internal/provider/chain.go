@@ -4,24 +4,28 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"time"
 )
 
-// Chain asks its providers in order, the next only when one answers
-// no_engines (§5.3). It is a Provider and a Contexter.
+// Chain is one endpoint's providers in order (§5.4): the next is asked
+// only when one is unavailable, within the request's budget. A member
+// that is a Budgeter gets at most its own budget while another follows
+// it. The zero Chain, and a nil one, has no members.
 type Chain struct {
 	list []Provider
 }
 
-// NewChain returns the chain of ps: ps[0] itself when it is alone.
-func NewChain(ps ...Provider) Provider {
-	if len(ps) == 1 {
-		return ps[0]
-	}
+// NewChain returns the chain of ps.
+func NewChain(ps ...Provider) *Chain {
 	return &Chain{list: ps}
 }
 
-// Name is the members' names joined by commas: "brave,searxng".
+// Name is the members' names joined by commas: "parallel,brave"; "" for
+// none.
 func (c *Chain) Name() string {
+	if c == nil {
+		return ""
+	}
 	names := make([]string, len(c.list))
 	for i, p := range c.list {
 		names[i] = p.Name()
@@ -29,112 +33,163 @@ func (c *Chain) Name() string {
 	return strings.Join(names, ",")
 }
 
-// Health is the first member's failure, or nil.
-func (c *Chain) Health(ctx context.Context) error {
-	for _, p := range c.list {
-		if err := p.Health(ctx); err != nil {
-			return err
-		}
+// Names is the members' names in order.
+func (c *Chain) Names() []string {
+	if c == nil || len(c.list) == 0 {
+		return []string{}
 	}
-	return nil
+	return strings.Split(c.Name(), ",")
 }
 
-// Search asks each member until one answers with results, or without
-// failed engines; the members that failed before it are listed first in
-// its EnginesFailed.
-func (c *Chain) Search(ctx context.Context, r SearchRequest) (Results, error) {
-	return ask(TraceOf(ctx), c.list, func(p Provider) (Results, error) {
-		return p.Search(ctx, r)
-	}, func(r *Results) (bool, *string, *[]string) {
-		return len(r.Items) > 0 || len(r.EnginesFailed) == 0, &r.Provider, &r.EnginesFailed
-	})
+// Members returns the providers in order.
+func (c *Chain) Members() []Provider {
+	if c == nil {
+		return nil
+	}
+	return c.list
 }
 
-// Context is Search for the members with context.
-func (c *Chain) Context(ctx context.Context, r ContextRequest) (Context, error) {
+// Empty reports a chain with no members.
+func (c *Chain) Empty() bool { return c == nil || len(c.list) == 0 }
+
+// Answered is how a chained request was answered: the member that
+// answered, and the members that failed before it, in order.
+type Answered struct {
+	Provider string
+	Failed   []string
+}
+
+// Search asks each member that is a Searcher in turn.
+func (c *Chain) Search(ctx context.Context, r SearchRequest) (Results, Answered, error) {
+	return ask(ctx, c, func(ctx context.Context, p Provider) (Results, error) {
+		return p.(Searcher).Search(ctx, r)
+	}, func(p Provider) bool { _, ok := p.(Searcher); return ok })
+}
+
+// Context asks each member that is a Contexter in turn.
+func (c *Chain) Context(ctx context.Context, r ContextRequest) (Context, Answered, error) {
+	return ask(ctx, c, func(ctx context.Context, p Provider) (Context, error) {
+		return p.(Contexter).Context(ctx, r)
+	}, func(p Provider) bool { _, ok := p.(Contexter); return ok })
+}
+
+// Extract asks each member that is an Extractor in turn.
+func (c *Chain) Extract(ctx context.Context, r ExtractRequest) (*Page, Answered, error) {
+	return ask(ctx, c, func(ctx context.Context, p Provider) (*Page, error) {
+		return p.(Extractor).Extract(ctx, r)
+	}, func(p Provider) bool { _, ok := p.(Extractor); return ok })
+}
+
+// ask is one chained request. Each member moved past is recorded in the
+// context's trace with its reason.
+func ask[A any](ctx context.Context, c *Chain, call func(context.Context, Provider) (A, error), able func(Provider) bool) (A, Answered, error) {
+	var zero A
 	var list []Provider
-	for _, p := range c.list {
-		if _, ok := p.(Contexter); ok {
+	for _, p := range c.Members() {
+		if able(p) {
 			list = append(list, p)
 		}
 	}
 	if len(list) == 0 {
-		return Context{}, notAvailable(c)
+		return zero, Answered{}, &NotAvailableError{"no configured provider answers this endpoint"}
 	}
-	return ask(TraceOf(ctx), list, func(p Provider) (Context, error) {
-		return p.(Contexter).Context(ctx, r)
-	}, func(a *Context) (bool, *string, *[]string) {
-		return len(a.Sources) > 0 || len(a.EnginesFailed) == 0, &a.Provider, &a.EnginesFailed
-	})
-}
-
-// ask is one chained request. call asks a member; fields reports whether
-// an answer is final and where its provider and failed engines are. Each
-// member moved past is recorded in trace.
-func ask[A any](trace *Trace, list []Provider, call func(Provider) (A, error), fields func(*A) (bool, *string, *[]string)) (A, error) {
+	trace := TraceOf(ctx)
 	var failed, msgs []string
 	for i, p := range list {
-		a, err := call(p)
 		last := i == len(list)-1
+		a, err, own := askOne(ctx, p, last, call)
 		if err == nil {
-			final, provider, engines := fields(&a)
-			if final || last {
-				if *provider == "" {
-					*provider = p.Name()
-				}
-				*engines = append(append([]string{}, failed...), *engines...)
-				return a, nil
-			}
-			err = &UnavailableError{Msg: p.Name() + ": no results while engines failed", Reason: ReasonNoResults}
+			return a, Answered{Provider: p.Name(), Failed: failed}, nil
 		}
-		u, ok := errors.AsType[*UnavailableError](err)
-		if !ok {
-			var zero A
-			return zero, err
+		var reason string
+		if u, ok := errors.AsType[*UnavailableError](err); ok {
+			reason = u.Reason
+		} else if _, ok := errors.AsType[*TimeoutError](err); ok && own {
+			reason = ReasonTimeout
+		} else {
+			// A final answer (a page that does not exist, a query refused),
+			// or the request's own budget gone: no member can do better.
+			return zero, Answered{Failed: failed}, err
+		}
+		if reason == "" {
+			reason = ReasonError
 		}
 		if !last {
-			reason := u.Reason
-			if reason == "" {
-				reason = ReasonError
-			}
 			trace.Fallback(p.Name(), reason)
 		}
 		failed, msgs = append(failed, p.Name()), append(msgs, err.Error())
+		if last && reason == ReasonTimeout {
+			return zero, Answered{Failed: failed}, &TimeoutError{strings.Join(msgs, "; ")}
+		}
 	}
-	var zero A
-	return zero, &UnavailableError{Msg: strings.Join(msgs, "; ")}
+	return zero, Answered{Failed: failed}, &UnavailableError{Msg: strings.Join(msgs, "; ")}
 }
 
-// Members returns a chain's providers, or p alone.
-func Members(p Provider) []Provider {
-	if c, ok := p.(*Chain); ok {
-		return c.list
+// askOne asks one member, under its share of the remaining budget when it
+// is a Budgeter and not last; own reports a timeout of that share, not of
+// the request's budget.
+func askOne[A any](ctx context.Context, p Provider, last bool, call func(context.Context, Provider) (A, error)) (A, error, bool) {
+	b, ok := p.(Budgeter)
+	deadline, has := ctx.Deadline()
+	if !ok || last || !has || b.BudgetShare() <= 0 || b.BudgetShare() >= 1 {
+		a, err := call(ctx, p)
+		return a, err, false
 	}
-	return []Provider{p}
+	share := time.Duration(float64(time.Until(deadline)) * b.BudgetShare())
+	sub, cancel := context.WithTimeout(ctx, share)
+	defer cancel()
+	a, err := call(sub, p)
+	own := err != nil && sub.Err() != nil && ctx.Err() == nil
+	if own {
+		if _, isTimeout := errors.AsType[*TimeoutError](err); !isTimeout {
+			err = &TimeoutError{p.Name() + " did not answer within its share of the budget"}
+		}
+	}
+	return a, err, own
 }
 
-// HasContext reports whether p, or a member of its chain, has context.
-func HasContext(p Provider) bool {
-	for _, m := range Members(p) {
-		if _, ok := m.(Contexter); ok {
+// can reports whether a member of c satisfies f.
+func (c *Chain) can(f func(Provider) bool) bool {
+	for _, p := range c.Members() {
+		if f(p) {
 			return true
 		}
 	}
 	return false
 }
 
-// ContextOf asks p for context: not_available when neither it nor a
-// member of its chain has any.
-func ContextOf(ctx context.Context, p Provider, r ContextRequest) (Context, error) {
-	switch c := p.(type) {
-	case *Chain:
-		return c.Context(ctx, r)
-	case Contexter:
-		return c.Context(ctx, r)
-	}
-	return Context{}, notAvailable(p)
+// CanSearch reports a Searcher among the members.
+func (c *Chain) CanSearch() bool {
+	return c.can(func(p Provider) bool { _, ok := p.(Searcher); return ok })
 }
 
-func notAvailable(p Provider) error {
-	return &NotAvailableError{p.Name() + " has no context endpoint; use /v1/search and /v1/fetch"}
+// CanContext reports a Contexter among the members.
+func (c *Chain) CanContext() bool {
+	return c.can(func(p Provider) bool { _, ok := p.(Contexter); return ok })
+}
+
+// CanExtract reports an Extractor among the members.
+func (c *Chain) CanExtract() bool {
+	return c.can(func(p Provider) bool { _, ok := p.(Extractor); return ok })
+}
+
+// Routes are the chains of the three endpoints (§5.4).
+type Routes struct {
+	Search, Context, Fetch *Chain
+}
+
+// Providers returns every distinct provider of the routes, in the order
+// they first appear.
+func (r Routes) Providers() []Provider {
+	var out []Provider
+	seen := map[string]bool{}
+	for _, c := range []*Chain{r.Search, r.Context, r.Fetch} {
+		for _, p := range c.Members() {
+			if !seen[p.Name()] {
+				seen[p.Name()] = true
+				out = append(out, p)
+			}
+		}
+	}
+	return out
 }

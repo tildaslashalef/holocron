@@ -9,11 +9,13 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tildaslashalef/holocron/internal/api"
 	"github.com/tildaslashalef/holocron/internal/fetch"
 	"github.com/tildaslashalef/holocron/internal/guard"
 	"github.com/tildaslashalef/holocron/internal/provider"
+	"github.com/tildaslashalef/holocron/internal/provider/local"
 )
 
 type fakeProvider struct{ n int }
@@ -22,7 +24,7 @@ func (fakeProvider) Name() string { return "fake" }
 func (p fakeProvider) Search(ctx context.Context, r provider.SearchRequest) (provider.Results, error) {
 	var res provider.Results
 	for i := range p.n {
-		res.Items = append(res.Items, provider.Result{Title: fmt.Sprintf("r%d", i), URL: fmt.Sprintf("https://example.org/%d", i), Engine: "e"})
+		res.Items = append(res.Items, provider.Result{Title: fmt.Sprintf("r%d", i), URL: fmt.Sprintf("https://example.org/%d", i), Snippets: []string{}})
 	}
 	return res, nil
 }
@@ -60,7 +62,12 @@ func (fakeFetcher) Fetch(ctx context.Context, raw string, done func()) (*fetch.P
 }
 
 func server(p provider.Provider) *httptest.Server {
-	return httptest.NewServer(api.NewServer("t", p, fakeFetcher{}, slog.New(slog.DiscardHandler), true))
+	routes := provider.Routes{
+		Search:  provider.NewChain(p),
+		Context: provider.NewChain(p),
+		Fetch:   provider.NewChain(local.New(fakeFetcher{}, api.ExtractSlots, time.Second)),
+	}
+	return httptest.NewServer(api.NewServer(api.Options{Version: "t", Routes: routes, Log: slog.New(slog.DiscardHandler), LogQueries: true}))
 }
 
 func TestPasses(t *testing.T) {
@@ -102,7 +109,10 @@ func TestFailures(t *testing.T) {
 	// Nothing listening: every check fails, none panics.
 	srv.Close()
 	out.Reset()
-	if err := Run(context.Background(), srv.URL, "check-test", &out); err == nil || !strings.HasPrefix(err.Error(), "15 of 15") {
+	var failed, total int
+	if err := Run(context.Background(), srv.URL, "check-test", &out); err == nil {
+		t.Error("no error")
+	} else if _, scanErr := fmt.Sscanf(err.Error(), "%d of %d checks failed", &failed, &total); scanErr != nil || failed != total || total < 10 {
 		t.Errorf("err = %v", err)
 	}
 }
@@ -110,16 +120,16 @@ func TestFailures(t *testing.T) {
 func TestContextBounded(t *testing.T) {
 	bad := "yesterday"
 	ok := []api.Source{{URL: "https://x/", Snippets: []string{"s"}}}
-	if err := contextBounded(api.Context{Provider: "p", EnginesFailed: []string{}, Sources: ok}, 1024); err != nil {
+	if err := contextBounded(api.Context{Provider: "p", ProvidersFailed: []string{}, Sources: ok}, 1024); err != nil {
 		t.Errorf("ok: %v", err)
 	}
 	for _, a := range []api.Context{
-		{Provider: "p", EnginesFailed: []string{}},
-		{Provider: "p", EnginesFailed: []string{}, Sources: []api.Source{{URL: "ftp://x/", Snippets: []string{}}}},
-		{Provider: "p", EnginesFailed: []string{}, Sources: []api.Source{ok[0], ok[0]}},
-		{Provider: "p", EnginesFailed: []string{}, Sources: []api.Source{{URL: "https://x/", Snippets: []string{"s"}, Published: &bad}}},
-		{Provider: "p", EnginesFailed: []string{}, Sources: []api.Source{{URL: "https://x/", Snippets: []string{}}}},
-		{Provider: "p", EnginesFailed: []string{}, Sources: []api.Source{{URL: "https://x/", Snippets: []string{strings.Repeat("a", 8*1024+1)}}}},
+		{Provider: "p", ProvidersFailed: []string{}},
+		{Provider: "p", ProvidersFailed: []string{}, Sources: []api.Source{{URL: "ftp://x/", Snippets: []string{}}}},
+		{Provider: "p", ProvidersFailed: []string{}, Sources: []api.Source{ok[0], ok[0]}},
+		{Provider: "p", ProvidersFailed: []string{}, Sources: []api.Source{{URL: "https://x/", Snippets: []string{"s"}, Published: &bad}}},
+		{Provider: "p", ProvidersFailed: []string{}, Sources: []api.Source{{URL: "https://x/", Snippets: []string{}}}},
+		{Provider: "p", ProvidersFailed: []string{}, Sources: []api.Source{{URL: "https://x/", Snippets: []string{strings.Repeat("a", 8*1024+1)}}}},
 	} {
 		if contextBounded(a, 1024) == nil {
 			t.Errorf("contextBounded(%+v) = nil", a)
@@ -129,13 +139,17 @@ func TestContextBounded(t *testing.T) {
 
 func TestBounded(t *testing.T) {
 	bad := "2026/01/01"
+	if err := bounded(api.Search{Provider: "p", ProvidersFailed: []string{}, Results: []api.Result{{URL: "https://x/", Snippets: []string{"a"}}}}); err != nil {
+		t.Errorf("ok: %v", err)
+	}
 	for _, s := range []api.Search{
-		{Provider: "p", EnginesFailed: []string{}, Results: []api.Result{{URL: "ftp://x/", Engine: "e"}}},
-		{Provider: "p", EnginesFailed: []string{}, Results: []api.Result{{URL: "https://x/", Engine: "e"}, {URL: "https://x/", Engine: "e"}}},
-		{Provider: "p", EnginesFailed: []string{}, Results: []api.Result{{URL: "https://x/", Engine: "e", Title: strings.Repeat("t", 201)}}},
-		{Provider: "p", EnginesFailed: []string{}, Results: []api.Result{{URL: "https://x/", Engine: "e", Published: &bad}}},
-		{Provider: "p", EnginesFailed: []string{}, Results: []api.Result{{URL: "https://x/"}}},
+		{Provider: "p", ProvidersFailed: []string{}, Results: []api.Result{{URL: "ftp://x/", Snippets: []string{}}}},
+		{Provider: "p", ProvidersFailed: []string{}, Results: []api.Result{{URL: "https://x/", Snippets: []string{}}, {URL: "https://x/", Snippets: []string{}}}},
+		{Provider: "p", ProvidersFailed: []string{}, Results: []api.Result{{URL: "https://x/", Title: strings.Repeat("t", 201), Snippets: []string{}}}},
+		{Provider: "p", ProvidersFailed: []string{}, Results: []api.Result{{URL: "https://x/", Published: &bad, Snippets: []string{}}}},
+		{Provider: "p", ProvidersFailed: []string{}, Results: []api.Result{{URL: "https://x/"}}},
 		{Provider: "p", Results: []api.Result{}},
+		{Provider: "p", ProvidersFailed: []string{}, Results: []api.Result{{URL: "https://x/", Snippets: make([]string, api.MaxSnippets+1)}}},
 	} {
 		if bounded(s) == nil {
 			t.Errorf("bounded(%+v) = nil", s)

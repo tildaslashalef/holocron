@@ -17,7 +17,6 @@ func TestRun(t *testing.T) {
 	}{
 		{nil, 2, "", "usage:"},
 		{[]string{"version"}, 0, "holocron dev (", ""},
-		{[]string{"version"}, 0, "searxng docker.io/searxng/searxng@sha256:", ""},
 		{[]string{"help"}, 0, "usage:", ""},
 		{[]string{"bogus"}, 2, "", `unknown command "bogus"`},
 		{[]string{"fetch"}, 2, "", "fetch needs one URL"},
@@ -28,26 +27,38 @@ func TestRun(t *testing.T) {
 		{[]string{"fetch", "https://example.org:8443/"}, 1, "", "bad_request"},
 		{[]string{"fetch", "--max-chars", "0", "https://example.org/"}, 2, "", "--max-chars"},
 		{[]string{"search"}, 2, "", "search needs a QUERY"},
-		{[]string{"search", "x", "--provider", "bing"}, 2, "", `unknown provider "bing"`},
-		{[]string{"search", "x", "--provider", "searxng,searxng"}, 2, "", `provider "searxng" is named twice`},
-		{[]string{"search", "x", "--provider", "brave"}, 1, "", "brave: --brave-key-file is required"},
-		{[]string{"search", "x", "--provider", "brave,searxng", "--brave-key-file", "/nonexistent/key"}, 1, "", "brave: reading the key"},
+		{[]string{"search", "x", "--search", "bing"}, 2, "", `--search: unknown provider "bing" (known: parallel, brave)`},
+		{[]string{"search", "x", "--search", "brave,brave"}, 2, "", `provider "brave" is named twice`},
+		{[]string{"search", "x", "--search", "brave"}, 1, "", "brave: no key: --brave-key-file, or the brave-key credential"},
+		{[]string{"search", "x", "--search", "parallel", "--parallel-key-file", "/nonexistent/key"}, 1, "", "parallel: the key file"},
+		{[]string{"search", "x"}, 1, "", "not_available: no search provider is configured"},
+		{[]string{"search", "x", "--parallel-search-mode", "slow"}, 2, "", "--parallel-search-mode must be one of turbo, fast, basic, advanced"},
 		{[]string{"context"}, 2, "", "context needs a QUERY"},
 		{[]string{"search", "x", "--freshness", "lastweek"}, 2, "", "--freshness must be"},
 		{[]string{"context", "x", "--freshness", "2026-10-02to2026-10-01"}, 2, "", "--freshness must be"},
 		{[]string{"context", "x", "--tokens", "10"}, 2, "", "--tokens must be 1024 or more"},
-		{[]string{"context", "x", "--searxng", "http://127.0.0.1:1"}, 1, "", "not_available: searxng has no context endpoint"},
+		{[]string{"context", "x"}, 1, "", "not_available: no context provider is configured"},
+		{[]string{"fetch", "--fetch", "brave", "https://example.org/"}, 2, "", `--fetch: unknown provider "brave" (known: parallel, local)`},
 		{[]string{"serve", "extra"}, 2, "", "serve takes no arguments"},
-		{[]string{"serve", "--provider", "kagi"}, 2, "", `unknown provider "kagi"`},
-		{[]string{"serve", "--searxng", "nope"}, 1, "", "not an http(s) base URL"},
+		{[]string{"serve", "--fetch", "kagi"}, 2, "", `unknown provider "kagi"`},
+		{[]string{"serve", "--context", "brave"}, 1, "", "brave: no key"},
+		{[]string{"serve", "--parallel-context-mode", "slow"}, 2, "", "--parallel-context-mode must be one of"},
 		{[]string{"serve", "-h"}, 0, "usage:", ""},
+		{[]string{"key"}, 2, "", "key needs set or rm, and a provider"},
+		{[]string{"key", "frob", "parallel"}, 2, "", "key needs set or rm"},
+		{[]string{"key", "set", "parallel", "extra"}, 2, "", "key needs set or rm"},
+		{[]string{"key", "set", "kagi"}, 2, "", `unknown provider "kagi" (keys: parallel, brave)`},
 		{[]string{"install", "now"}, 2, "", "install takes no arguments"},
 		{[]string{"check", "a", "b"}, 2, "", "at most one BASE_URL"},
-		{[]string{"check", "http://127.0.0.1:1"}, 1, "FAIL health", "15 of 15 checks failed"},
+		{[]string{"check", "http://127.0.0.1:1"}, 1, "FAIL health", "checks failed"},
 	}
+	t.Setenv("CREDENTIALS_DIRECTORY", "") // no key from the host
 	for _, tt := range tests {
+		if strings.Contains(tt.stderr, "searxng") || strings.Contains(tt.stdout, "searxng") {
+			t.Fatal("stale row")
+		}
 		var stdout, stderr bytes.Buffer
-		code := run(tt.args, &stdout, &stderr)
+		code := run(tt.args, strings.NewReader(""), &stdout, &stderr)
 		if code != tt.code {
 			t.Errorf("run(%q) = %d, want %d (stderr %q)", tt.args, code, tt.code, stderr.String())
 		}

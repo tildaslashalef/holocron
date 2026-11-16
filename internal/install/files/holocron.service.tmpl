@@ -2,26 +2,30 @@
 # are overwritten on the next install.
 [Unit]
 Description=holocron: web search and page fetch for AI agents
-Wants=network-online.target searxng.service
-After=network-online.target searxng.service
+Wants=network-online.target
+After=network-online.target
 
 [Service]
 User=holocron
 Group=holocron
-# All addresses: the deployment's firewall decides who reaches it.
-{{- if .Brave}}
-# Brave's key, present on this host when this unit was written (SPEC.md
-# § 9 step 3): systemd copies it where only this service reads it.
-LoadCredential=brave-key:{{.KeyPath}}
-ExecStart=/usr/local/bin/holocron serve --listen 0.0.0.0:8080 --provider brave,searxng --brave-key-file ${CREDENTIALS_DIRECTORY}/brave-key
+{{- range .Keys}}
+{{- if .Encrypted}}
+# {{.Name}}'s key, encrypted at rest (systemd-creds): systemd decrypts it
+# where only this service reads it, as $CREDENTIALS_DIRECTORY/{{.Name}}-key.
+LoadCredentialEncrypted={{.Name}}-key:{{.Path}}
 {{- else}}
-ExecStart=/usr/local/bin/holocron serve --listen 0.0.0.0:8080
+# {{.Name}}'s key, a plain 0600 file: systemd copies it where only this
+# service reads it. `holocron key set {{.Name}}` encrypts it.
+LoadCredential={{.Name}}-key:{{.Path}}
 {{- end}}
+{{- end}}
+# All addresses: the deployment's firewall decides who reaches it.
+ExecStart=/usr/local/bin/holocron serve --listen 0.0.0.0:8080 --search {{.Search}} --context {{.Context}} --fetch {{.Fetch}}
 Restart=on-failure
 RestartSec=2s
-MemoryMax=1G
-Environment=GOMEMLIMIT=800MiB
-TasksMax=64
+MemoryMax=768M
+Environment=GOMEMLIMIT=600MiB
+TasksMax=96
 
 ProtectSystem=strict
 ProtectHome=yes

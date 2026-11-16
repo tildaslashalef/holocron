@@ -19,6 +19,7 @@ import (
 	"github.com/tildaslashalef/holocron/internal/fetch"
 	"github.com/tildaslashalef/holocron/internal/guard"
 	"github.com/tildaslashalef/holocron/internal/provider"
+	"github.com/tildaslashalef/holocron/internal/provider/local"
 )
 
 type fakeProvider struct {
@@ -78,11 +79,25 @@ type harness struct {
 	mu  *sync.Mutex
 }
 
-func newHarness(p provider.Provider, f Fetcher, logQueries bool) harness {
+// newHarness serves p (a provider, or a chain) for search and context,
+// and f through the local provider for fetch.
+func newHarness(p any, f local.Fetcher, logQueries bool) harness {
 	var buf bytes.Buffer
 	mu := &sync.Mutex{}
 	log := slog.New(slog.NewTextHandler(lockedWriter{&buf, mu}, nil))
-	return harness{NewServer("1.2.3", p, f, log, logQueries), &buf, mu}
+	var chain *provider.Chain
+	switch v := p.(type) {
+	case *provider.Chain:
+		chain = v
+	case provider.Provider:
+		chain = provider.NewChain(v)
+	}
+	if f == nil {
+		f = &fakeFetcher{page: &fetch.Page{Status: 200, ContentType: "text/plain", Text: "x"}}
+	}
+	routes := provider.Routes{Search: chain, Context: chain, Fetch: provider.NewChain(local.New(f, ExtractSlots, SlotWait))}
+	srv := NewServer(Options{Version: "1.2.3", Routes: routes, Log: log, LogQueries: logQueries, Dashboard: true})
+	return harness{srv, &buf, mu}
 }
 
 type lockedWriter struct {
@@ -145,28 +160,26 @@ func TestSearch(t *testing.T) {
 	long := strings.Repeat("word ", 60)
 	p := &fakeProvider{res: provider.Results{
 		Items: []provider.Result{
-			{Title: "  A \n title ", URL: "https://a.example/1", Snippet: "s\t1", Engine: "duckduckgo", Published: "2026-09-01"},
-			{Title: "dup", URL: "https://a.example/1", Engine: "brave"},
-			{Title: "ftp", URL: "ftp://a.example/", Engine: "brave"},
-			{Title: "rel", URL: "/relative", Engine: "brave"},
+			{Title: "  A \n title ", URL: "https://a.example/1", Snippet: "s\t1", Published: "2026-09-01"},
+			{Title: "dup", URL: "https://a.example/1"},
+			{Title: "ftp", URL: "ftp://a.example/"},
+			{Title: "rel", URL: "/relative"},
 			{Title: long, URL: "http://b.example/", Snippet: strings.Repeat("snip ", 200)},
 		},
-		EnginesFailed: []string{"mojeek"},
 	}}
 	h := newHarness(p, nil, true)
 	var s Search
 	h.do(t, http.MethodGet, "/v1/search?q=+zig+std.http.Client+&n=20", &s)
-	if s.Query != "zig std.http.Client" || s.Provider != "fake" || len(s.Results) != 2 ||
-		len(s.EnginesFailed) != 1 || s.EnginesFailed[0] != "mojeek" {
+	if s.Query != "zig std.http.Client" || s.Provider != "fake" || len(s.Results) != 2 || s.ProvidersFailed == nil || len(s.ProvidersFailed) != 0 {
 		t.Fatalf("search = %+v", s)
 	}
 	r0, r1 := s.Results[0], s.Results[1]
-	if r0.Title != "A title" || r0.Snippet != "s 1" || r0.Engine != "duckduckgo" || r0.Published == nil || *r0.Published != "2026-09-01" {
+	if r0.Title != "A title" || r0.Snippet != "s 1" || r0.Snippets == nil || r0.Published == nil || *r0.Published != "2026-09-01" {
 		t.Errorf("result 0 = %+v", r0)
 	}
 	if len([]rune(r1.Title)) > MaxTitle || !strings.HasSuffix(r1.Title, "…") ||
 		len([]rune(r1.Snippet)) > MaxSnippet || !strings.HasSuffix(r1.Snippet, "…") ||
-		r1.Engine != "fake" || r1.Published != nil {
+		r1.Published != nil {
 		t.Errorf("result 1 = %+v", r1)
 	}
 
@@ -192,15 +205,18 @@ func TestSearch(t *testing.T) {
 func TestSearchEmptyAndFailures(t *testing.T) {
 	var s Search
 	h := newHarness(&fakeProvider{}, nil, true)
-	if resp := h.do(t, http.MethodGet, "/v1/search?q=x", &s); resp.StatusCode != 200 || s.Results == nil || len(s.Results) != 0 || s.EnginesFailed == nil {
+	if resp := h.do(t, http.MethodGet, "/v1/search?q=x", &s); resp.StatusCode != 200 || s.Results == nil || len(s.Results) != 0 || s.ProvidersFailed == nil {
 		t.Errorf("empty: %d %+v", resp.StatusCode, s)
 	}
-	h = newHarness(&fakeProvider{res: provider.Results{EnginesFailed: []string{"brave", "mojeek"}}}, nil, true)
-	if msg := h.wantError(t, "/v1/search?q=x", 503, "no_engines"); !strings.Contains(msg, "brave, mojeek") {
+	h = newHarness(provider.NewChain(
+		namedProvider{&fakeProvider{err: &provider.UnavailableError{Msg: "parallel: down"}}, "parallel"},
+		namedProvider{&fakeProvider{err: &provider.UnavailableError{Msg: "brave: down"}}, "brave"},
+	), nil, true)
+	if msg := h.wantError(t, "/v1/search?q=x", 503, "provider_unavailable"); !strings.Contains(msg, "parallel: down; brave: down") {
 		t.Errorf("message %q", msg)
 	}
 	h = newHarness(&fakeProvider{err: &provider.UnavailableError{Msg: "down"}}, nil, true)
-	h.wantError(t, "/v1/search?q=x", 503, "no_engines")
+	h.wantError(t, "/v1/search?q=x", 503, "provider_unavailable")
 	h = newHarness(&fakeProvider{err: &provider.TimeoutError{Msg: "slow"}}, nil, true)
 	h.wantError(t, "/v1/search?q=x", 504, "upstream_timeout")
 }
@@ -213,7 +229,8 @@ func TestFetch(t *testing.T) {
 
 	var got Fetch
 	h.do(t, http.MethodGet, "/v1/fetch?url="+url.QueryEscape("https://example.org/a"), &got)
-	if got.URL != "https://example.org/a" || got.FinalURL != "https://example.org/a/" || got.Status != 200 || got.ContentType != "text/html" ||
+	if got.URL != "https://example.org/a" || got.FinalURL != "https://example.org/a/" || got.Status == nil || *got.Status != 200 ||
+		got.ContentType == nil || *got.ContentType != "text/html" || got.Provider != "local" || got.Focused ||
 		got.Title != "T" || got.Text != text || got.Start != 0 || got.Chars != chars || got.Truncated {
 		t.Errorf("whole = %+v", got)
 	}
@@ -284,7 +301,7 @@ func TestRouting(t *testing.T) {
 	if resp.StatusCode != 405 {
 		t.Errorf("HEAD: %d", resp.StatusCode)
 	}
-	for _, p := range []string{"/", "/v1", "/v1/search/", "/v2/search", "/v1/nope"} {
+	for _, p := range []string{"/index.html", "/ui/", "/ui/nope.js", "/v1", "/v1/search/", "/v2/search", "/v1/nope"} {
 		h.wantError(t, p, 404, "not_found")
 	}
 }
@@ -352,11 +369,96 @@ func TestSlotHeldByAbandonedExtraction(t *testing.T) {
 	if rec.Code != 504 {
 		t.Fatalf("status %d", rec.Code)
 	}
-	if len(h.srv.slots) != 1 {
-		t.Fatalf("%d slots held after the answer, want 1", len(h.srv.slots))
+	lp := h.srv.routes.Fetch.Members()[0].(*local.Provider)
+	if n, _ := lp.Slots(); n != 1 {
+		t.Fatalf("%d extraction slots held after the answer, want 1", n)
 	}
 	close(block)
-	waitFor(t, func() bool { return len(h.srv.slots) == 0 })
+	waitFor(t, func() bool { n, _ := lp.Slots(); return n == 0 })
+}
+
+// §8.3: the dashboard's files come with a strict policy, and only when it
+// is on; neither they nor /v1/stats are logged.
+func TestDashboard(t *testing.T) {
+	h := newHarness(&fakeProvider{}, nil, true)
+	for path, ctype := range map[string]string{"/": "text/html", "/ui/app.js": "text/javascript", "/ui/app.css": "text/css", "/favicon.ico": "image/svg+xml"} {
+		rec := httptest.NewRecorder()
+		h.srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		hd := rec.Header()
+		if rec.Code != 200 || !strings.HasPrefix(hd.Get("Content-Type"), ctype) || rec.Body.Len() == 0 ||
+			hd.Get("Content-Security-Policy") != csp || hd.Get("X-Content-Type-Options") != "nosniff" || hd.Get("X-Frame-Options") != "DENY" {
+			t.Errorf("%s: %d %v", path, rec.Code, hd)
+		}
+	}
+	if !strings.Contains(csp, "script-src 'self';") || strings.Contains(csp, "unsafe") {
+		t.Errorf("csp %q", csp)
+	}
+	if h.logged() != "" {
+		t.Errorf("logged:\n%s", h.logged())
+	}
+	// The page builds its DOM from text: no HTML from data.
+	for _, name := range []string{"ui/app.js", "ui/index.html"} {
+		b, _ := ui.ReadFile(name)
+		for _, bad := range []string{"innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function", "<script>"} {
+			if strings.Contains(string(b), bad) {
+				t.Errorf("%s holds %q", name, bad)
+			}
+		}
+	}
+
+	off := NewServer(Options{Version: "1", Routes: h.srv.routes, Log: slog.New(slog.DiscardHandler)})
+	for _, path := range []string{"/", "/ui/app.js", "/v1/stats"} {
+		rec := httptest.NewRecorder()
+		off.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != 404 {
+			t.Errorf("off %s: %d", path, rec.Code)
+		}
+	}
+}
+
+// /v1/stats counts requests, keeps a query as a plain string, and shows
+// queries and URLs only when they are logged.
+func TestStats(t *testing.T) {
+	for _, logQueries := range []bool{true, false} {
+		h := newHarness(&namedProvider{&fakeProvider{res: results(2)}, "parallel"}, nil, logQueries)
+		evil := `<script>alert(1)</script>`
+		h.do(t, http.MethodGet, "/v1/search?q="+url.QueryEscape(evil), nil)
+		h.do(t, http.MethodGet, "/v1/search?q="+url.QueryEscape(evil), nil)
+		h.do(t, http.MethodGet, "/v1/fetch?url=https://example.org/secret", nil)
+		h.do(t, http.MethodGet, "/v1/search?q=", nil)
+		rec := httptest.NewRecorder()
+		h.srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v1/stats", nil))
+		var st StatsBody
+		if err := json.Unmarshal(rec.Body.Bytes(), &st); rec.Code != 200 || err != nil {
+			t.Fatalf("stats: %d %v", rec.Code, err)
+		}
+		if st.Totals.Requests != 4 || st.Totals.Errors != 1 || st.Totals.Hits != 1 || len(st.Recent) != 4 || st.Version != "1.2.3" {
+			t.Errorf("totals %+v, %d recent", st.Totals, len(st.Recent))
+		}
+		var answered int64
+		for _, p := range st.Providers {
+			if p.Name == "parallel" {
+				answered = p.Answered
+			}
+		}
+		if answered != 2 || st.Codes["bad_request"] != 1 {
+			t.Errorf("providers %+v codes %v", st.Providers, st.Codes)
+		}
+		raw := rec.Body.String()
+		queried := false
+		for _, r := range st.Recent {
+			if r.Query == evil {
+				queried = true
+			}
+		}
+		if queried != logQueries || strings.Contains(raw, "secret") != logQueries {
+			t.Errorf("log queries %v: recent %+v", logQueries, st.Recent)
+		}
+		// The query is data: JSON that no browser sniffs into a page.
+		if ct := rec.Header().Get("Content-Type"); ct != "application/json; charset=utf-8" || rec.Header().Get("X-Content-Type-Options") != "nosniff" {
+			t.Errorf("stats headers %v", rec.Header())
+		}
+	}
 }
 
 func TestPanicRecovered(t *testing.T) {

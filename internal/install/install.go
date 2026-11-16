@@ -1,11 +1,10 @@
 package install
 
 import (
+	"bufio"
 	"bytes"
 	"context"
-	"crypto/rand"
 	"embed"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +18,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"text/template"
@@ -38,6 +38,12 @@ type System interface {
 	Booted() bool
 	// Run runs a command with its output to w.
 	Run(ctx context.Context, w io.Writer, name string, args ...string) error
+	// RunInput is Run with input on the command's stdin.
+	RunInput(ctx context.Context, w io.Writer, input []byte, name string, args ...string) error
+	// Terminal reports whether f is a terminal; NoEcho turns its echo off
+	// and returns what turns it back on.
+	Terminal(f *os.File) bool
+	NoEcho(f *os.File) (restore func())
 }
 
 // Options configure Run.
@@ -51,19 +57,36 @@ type Options struct {
 }
 
 const (
-	settingsPath  = "/etc/searxng/settings.yml"
-	containerPath = "/etc/containers/systemd/searxng.container"
-	unitPath      = "/etc/systemd/system/holocron.service"
-	cacheDir      = "/var/cache/searxng"
-	// BraveKeyPath is where the deployment puts Brave's key; its presence
-	// makes the unit run brave,searxng (§9 step 3).
-	BraveKeyPath = "/etc/holocron/brave.key"
+	unitPath = "/etc/systemd/system/holocron.service"
+	// KeyDir holds plain key files, <provider>.key (§9 step 3).
+	KeyDir = "/etc/holocron"
+	// CredStore holds encrypted keys, holocron.<provider>-key, where
+	// systemd-creds puts them (§9 step 3).
+	CredStore = "/etc/credstore.encrypted"
+
+	// What an older install wrote for SearXNG, removed by this one.
+	legacyContainer = "/etc/containers/systemd/searxng.container"
+	legacySettings  = "/etc/searxng"
+	legacyCache     = "/var/cache/searxng"
 )
 
-// Run sets the host up (§9): checks, user, SearXNG's files and image,
-// holocron's unit, the restarts, and the wait for health. It is
-// idempotent.
-func Run(ctx context.Context, o Options) error {
+// KeyProviders are the providers that take a key, in their default order.
+var KeyProviders = []string{"parallel", "brave"}
+
+// PlainKey is where a provider's plain key file is.
+func PlainKey(name string) string { return KeyDir + "/" + name + ".key" }
+
+// EncryptedKey is where a provider's encrypted key is.
+func EncryptedKey(name string) string { return CredStore + "/holocron." + name + "-key" }
+
+// Key is one provider's key on the host.
+type Key struct {
+	Name      string
+	Path      string
+	Encrypted bool
+}
+
+func (o *Options) defaults() {
 	if o.System == nil {
 		o.System = hostSystem{}
 	}
@@ -76,17 +99,19 @@ func Run(ctx context.Context, o Options) error {
 	if o.Wait == 0 {
 		o.Wait = 60 * time.Second
 	}
+}
+
+// Run sets the host up (§9): checks, user, the keys, SearXNG's removal
+// when an older install left it, holocron's unit, the restart, and the
+// wait for health. It is idempotent.
+func Run(ctx context.Context, o Options) error {
+	o.defaults()
 	in := &installer{Options: o}
 	if o.DryRun {
 		in.say("dry run: nothing is changed")
 	}
-
-	if missing := in.check(); len(missing) > 0 {
-		msg := "this host lacks: " + strings.Join(missing, "; ")
-		if !o.DryRun {
-			return errors.New(msg)
-		}
-		in.say("check: %s (continuing: dry run)", msg)
+	if err := in.checkHost(); err != nil {
+		return err
 	}
 
 	if !o.System.UserExists("holocron") {
@@ -96,38 +121,36 @@ func Run(ctx context.Context, o Options) error {
 		}
 	}
 
-	secret, err := in.secret()
+	keys, err := in.keys()
 	if err != nil {
 		return err
 	}
-	settings, err := render("files/settings.yml.tmpl", map[string]string{"SecretKey": secret})
+	var withKey []string
+	for _, k := range keys {
+		withKey = append(withKey, k.Name)
+	}
+	search := "none"
+	if len(withKey) > 0 {
+		search = strings.Join(withKey, ",")
+	}
+	fetch := "local"
+	if slices.Contains(withKey, "parallel") {
+		fetch = "parallel,local"
+	}
+	in.say("routes: /v1/search %s, /v1/context %s, /v1/fetch %s", search, search, fetch)
+	if len(keys) == 0 {
+		in.say("no provider key on this host: search and context answer not_available; add one with: holocron key set parallel")
+	}
+
+	if err := in.removeSearXNG(ctx); err != nil {
+		return err
+	}
+
+	unit, err := render("files/holocron.service.tmpl", map[string]any{"Keys": keys, "Search": search, "Context": search, "Fetch": fetch})
 	if err != nil {
 		return err
 	}
-	container, err := render("files/searxng.container", map[string]string{"Image": SearXNGImage})
-	if err != nil {
-		return err
-	}
-	brave, err := in.braveKey()
-	if err != nil {
-		return err
-	}
-	unit, err := render("files/holocron.service.tmpl", map[string]any{"Brave": brave, "KeyPath": BraveKeyPath})
-	if err != nil {
-		return err
-	}
-	for _, dir := range []string{"/etc/searxng", cacheDir, filepath.Dir(containerPath), filepath.Dir(unitPath)} {
-		if err := in.mkdir(dir); err != nil {
-			return err
-		}
-	}
-	if err := in.write(settingsPath, settings, 0o600); err != nil {
-		return err
-	}
-	if err := in.write(containerPath, container, 0o644); err != nil {
-		return err
-	}
-	if err := in.run(ctx, "podman", "pull", SearXNGImage); err != nil {
+	if err := in.mkdir(filepath.Dir(unitPath)); err != nil {
 		return err
 	}
 	if err := in.write(unitPath, unit, 0o644); err != nil {
@@ -135,7 +158,6 @@ func Run(ctx context.Context, o Options) error {
 	}
 	for _, cmd := range [][]string{
 		{"systemctl", "daemon-reload"},
-		{"systemctl", "restart", "searxng.service"},
 		{"systemctl", "enable", "holocron.service"},
 		{"systemctl", "restart", "holocron.service"},
 	} {
@@ -143,43 +165,221 @@ func Run(ctx context.Context, o Options) error {
 			return err
 		}
 	}
-	return in.waitHealthy(ctx)
+	return in.waitHealthy(ctx, len(keys) > 0)
+}
+
+// checkHost fails on a host that lacks what install needs; a dry run
+// reports it and goes on.
+func (in *installer) checkHost() error {
+	missing := in.check()
+	if len(missing) == 0 {
+		return nil
+	}
+	msg := "this host lacks: " + strings.Join(missing, "; ")
+	if !in.DryRun {
+		return errors.New(msg)
+	}
+	in.say("check: %s (continuing: dry run)", msg)
+	return nil
+}
+
+// keys finds each provider's key: encrypted first, else a plain file,
+// made 0600 if it is not (systemd reads it as root, whoever owns it).
+func (in *installer) keys() ([]Key, error) {
+	var out []Key
+	for _, name := range KeyProviders {
+		if fi, err := os.Lstat(in.path(EncryptedKey(name))); err == nil && fi.Mode().IsRegular() {
+			in.say("key: %s, encrypted (%s)", name, EncryptedKey(name))
+			out = append(out, Key{name, EncryptedKey(name), true})
+			continue
+		}
+		plain := PlainKey(name)
+		fi, err := os.Lstat(in.path(plain))
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			return nil, err
+		}
+		if !fi.Mode().IsRegular() {
+			return nil, fmt.Errorf("%s is not a regular file", plain)
+		}
+		in.say("key: %s, a plain file (%s); encrypt it with: holocron key set %s < %s", name, plain, name, plain)
+		if fi.Mode().Perm() != 0o600 {
+			if in.DryRun {
+				in.say("would chmod 600 %s", plain)
+			} else {
+				in.say("chmod 600 %s", plain)
+				if err := os.Chmod(in.path(plain), 0o600); err != nil {
+					return nil, err
+				}
+			}
+		}
+		out = append(out, Key{name, plain, false})
+	}
+	return out, nil
+}
+
+var imageLine = regexp.MustCompile(`(?m)^\s*Image=(\S+)\s*$`)
+
+// removeSearXNG removes what an install before 0.2.0 wrote for SearXNG
+// (§9 step 4): its unit, its settings and cache, and its image. Podman
+// itself is the host's package, and stays.
+func (in *installer) removeSearXNG(ctx context.Context) error {
+	var found []string
+	for _, p := range []string{legacyContainer, legacySettings, legacyCache} {
+		if _, err := os.Lstat(in.path(p)); err == nil {
+			found = append(found, p)
+		}
+	}
+	if len(found) == 0 {
+		return nil
+	}
+	in.say("SearXNG from an older install: removing %s", strings.Join(found, ", "))
+	var image string
+	if b, err := os.ReadFile(in.path(legacyContainer)); err == nil {
+		if m := imageLine.FindSubmatch(b); m != nil {
+			image = string(m[1])
+		}
+	}
+	// A quadlet's unit is generated: stopping it and removing its file is
+	// how it goes.
+	in.runQuiet(ctx, "systemctl", "stop", "searxng.service")
+	for _, p := range found {
+		if err := in.remove(p); err != nil {
+			return err
+		}
+	}
+	if err := in.run(ctx, "systemctl", "daemon-reload"); err != nil {
+		return err
+	}
+	if image != "" {
+		if _, err := in.System.LookPath("podman"); err == nil {
+			in.runQuiet(ctx, "podman", "rmi", image)
+		}
+	}
+	in.say("SearXNG is removed; Podman is the host's package: sudo apt purge podman && sudo apt autoremove --purge")
+	return nil
+}
+
+// SetKey stores a provider's key read from r (§9.4): encrypted with
+// systemd-creds when the host has it, else a plain 0600 file; then Run.
+// The key goes to systemd-creds on its stdin, never in an argument.
+func SetKey(ctx context.Context, o Options, name string, r io.Reader) error {
+	o.defaults()
+	in := &installer{Options: o}
+	if err := in.checkHost(); err != nil {
+		return err
+	}
+	_, credsErr := o.System.LookPath("systemd-creds")
+	if o.DryRun {
+		if credsErr == nil {
+			in.say("would read %s's key from stdin and run: systemd-creds encrypt --name=%s-key - %s", name, name, EncryptedKey(name))
+		} else {
+			in.say("would read %s's key from stdin and write %s (mode 600): this host has no systemd-creds", name, PlainKey(name))
+		}
+		return Run(ctx, o)
+	}
+	key, err := readKey(o.System, r, o.Out, name)
+	if err != nil {
+		return err
+	}
+	if credsErr == nil {
+		if err := in.mkdirMode(CredStore, 0o700); err != nil {
+			return err
+		}
+		line := fmt.Sprintf("systemd-creds encrypt --name=%s-key - %s", name, EncryptedKey(name))
+		in.say("run: %s", line)
+		if err := o.System.RunInput(ctx, o.Out, []byte(key), "systemd-creds", "encrypt", "--name="+name+"-key", "-", in.path(EncryptedKey(name))); err != nil {
+			return fmt.Errorf("%s: %w", line, err)
+		}
+		if err := os.Chmod(in.path(EncryptedKey(name)), 0o600); err != nil {
+			return err
+		}
+		if _, err := os.Lstat(in.path(PlainKey(name))); err == nil {
+			if err := in.remove(PlainKey(name)); err != nil {
+				return err
+			}
+		}
+	} else {
+		in.say("this host has no systemd-creds: the key is a plain file, readable by root only")
+		if err := in.mkdirMode(KeyDir, 0o700); err != nil {
+			return err
+		}
+		if err := in.write(PlainKey(name), []byte(key+"\n"), 0o600); err != nil {
+			return err
+		}
+	}
+	return Run(ctx, o)
+}
+
+// RemoveKey removes a provider's key, encrypted and plain, then Run.
+func RemoveKey(ctx context.Context, o Options, name string) error {
+	o.defaults()
+	in := &installer{Options: o}
+	if err := in.checkHost(); err != nil {
+		return err
+	}
+	removed := false
+	for _, p := range []string{EncryptedKey(name), PlainKey(name)} {
+		if _, err := os.Lstat(in.path(p)); err == nil {
+			if err := in.remove(p); err != nil {
+				return err
+			}
+			removed = true
+		}
+	}
+	if !removed {
+		in.say("%s has no key on this host", name)
+	}
+	return Run(ctx, o)
+}
+
+// readKey reads one line from r, with the terminal's echo off when r is
+// one. The key is never printed.
+func readKey(sys System, r io.Reader, out io.Writer, name string) (string, error) {
+	if f, ok := r.(*os.File); ok && sys.Terminal(f) {
+		fmt.Fprintf(out, "%s key (not shown), then Enter: ", name)
+		restore := sys.NoEcho(f)
+		defer func() { restore(); fmt.Fprintln(out) }()
+	}
+	// One line: a terminal sends it on Enter, a file or pipe may end
+	// without a newline.
+	line, err := bufio.NewReader(io.LimitReader(r, 4096)).ReadString('\n')
+	if err != nil && !errors.Is(err, io.EOF) {
+		return "", err
+	}
+	key := strings.TrimSpace(line)
+	if key == "" || strings.ContainsAny(key, " \t\r") {
+		return "", fmt.Errorf("%s: no key on stdin (one line, no spaces)", name)
+	}
+	return key, nil
 }
 
 type installer struct {
 	Options
 }
 
-func (in *installer) say(format string, args ...any) {
-	fmt.Fprintf(in.Out, format+"\n", args...)
+// runQuiet runs a command whose failure does not matter (a unit already
+// gone), saying so.
+func (in *installer) runQuiet(ctx context.Context, name string, args ...string) {
+	if err := in.run(ctx, name, args...); err != nil && !in.DryRun {
+		in.say("(ignored: %v)", err)
+	}
 }
 
-// braveKey reports whether Brave's key is on the host, and makes it 0600
-// if it is not (§9 step 3). systemd reads it as root, whoever owns it.
-func (in *installer) braveKey() (bool, error) {
-	fi, err := os.Lstat(in.path(BraveKeyPath))
-	if errors.Is(err, fs.ErrNotExist) {
-		in.say("provider: searxng (no %s)", BraveKeyPath)
-		return false, nil
+// remove deletes a file or a directory with its contents.
+func (in *installer) remove(p string) error {
+	if in.DryRun {
+		in.say("would remove %s", p)
+		return nil
 	}
-	if err != nil {
-		return false, err
-	}
-	if !fi.Mode().IsRegular() {
-		return false, fmt.Errorf("%s is not a regular file", BraveKeyPath)
-	}
-	in.say("provider: brave,searxng (%s is present)", BraveKeyPath)
-	if fi.Mode().Perm() != 0o600 {
-		if in.DryRun {
-			in.say("would chmod 600 %s", BraveKeyPath)
-		} else {
-			in.say("chmod 600 %s", BraveKeyPath)
-			if err := os.Chmod(in.path(BraveKeyPath), 0o600); err != nil {
-				return false, err
-			}
-		}
-	}
-	return true, nil
+	in.say("remove %s", p)
+	return os.RemoveAll(in.path(p))
+}
+
+func (in *installer) say(format string, args ...any) {
+	fmt.Fprintf(in.Out, format+"\n", args...)
 }
 
 // check returns what the host lacks, by name.
@@ -194,7 +394,7 @@ func (in *installer) check() []string {
 	if !in.System.Booted() {
 		missing = append(missing, "systemd as init")
 	}
-	for _, tool := range []string{"systemctl", "podman", "useradd"} {
+	for _, tool := range []string{"systemctl", "useradd"} {
 		if _, err := in.System.LookPath(tool); err != nil {
 			missing = append(missing, tool+" on PATH")
 		}
@@ -219,7 +419,9 @@ func (in *installer) path(p string) string {
 	return filepath.Join(in.Root, p)
 }
 
-func (in *installer) mkdir(dir string) error {
+func (in *installer) mkdir(dir string) error { return in.mkdirMode(dir, 0o755) }
+
+func (in *installer) mkdirMode(dir string, mode fs.FileMode) error {
 	if fi, err := os.Stat(in.path(dir)); err == nil && fi.IsDir() {
 		return nil
 	}
@@ -228,11 +430,11 @@ func (in *installer) mkdir(dir string) error {
 		return nil
 	}
 	in.say("create %s/", dir)
-	return os.MkdirAll(in.path(dir), 0o755)
+	return os.MkdirAll(in.path(dir), mode)
 }
 
 // write replaces path with data when they differ, atomically, keeping the
-// owner of the file it replaces (SearXNG's entrypoint owns /etc/searxng).
+// owner of the file it replaces.
 func (in *installer) write(path string, data []byte, mode fs.FileMode) error {
 	full := in.path(path)
 	old, err := os.ReadFile(full)
@@ -286,23 +488,6 @@ func (in *installer) write(path string, data []byte, mode fs.FileMode) error {
 	return os.Rename(tmp.Name(), full)
 }
 
-var secretLine = regexp.MustCompile(`(?m)^\s*secret_key:\s*"([0-9a-f]{64})"\s*$`)
-
-// secret returns the secret_key of an existing settings.yml, else a new
-// one from crypto/rand.
-func (in *installer) secret() (string, error) {
-	if old, err := os.ReadFile(in.path(settingsPath)); err == nil {
-		if m := secretLine.FindSubmatch(old); m != nil {
-			return string(m[1]), nil
-		}
-	}
-	b := make([]byte, 32)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(b), nil
-}
-
 func render(name string, data any) ([]byte, error) {
 	t, err := template.ParseFS(files, name)
 	if err != nil {
@@ -316,9 +501,9 @@ func render(name string, data any) ([]byte, error) {
 }
 
 // waitHealthy waits for /v1/health to report every provider ok, then
-// prints it and a three-result search. On timeout it prints the units'
+// prints it and, with a search provider, a three-result search. On timeout it prints the unit's
 // last journal lines and fails.
-func (in *installer) waitHealthy(ctx context.Context) error {
+func (in *installer) waitHealthy(ctx context.Context, searches bool) error {
 	healthURL := in.HealthBase + "/v1/health"
 	if in.DryRun {
 		in.say("would wait up to %s for %s", in.Wait, healthURL)
@@ -337,9 +522,7 @@ func (in *installer) waitHealthy(ctx context.Context) error {
 		last = body
 		if time.Now().After(deadline) {
 			in.say("holocron is not healthy after %s (last: %s); the journal:", in.Wait, last)
-			for _, unit := range []string{"searxng.service", "holocron.service"} {
-				in.System.Run(ctx, in.Out, "journalctl", "--no-pager", "-n", "40", "-u", unit)
-			}
+			in.System.Run(ctx, in.Out, "journalctl", "--no-pager", "-n", "40", "-u", "holocron.service")
 			return fmt.Errorf("holocron did not become healthy within %s", in.Wait)
 		}
 		select {
@@ -348,7 +531,10 @@ func (in *installer) waitHealthy(ctx context.Context) error {
 		case <-time.After(time.Second):
 		}
 	}
-	searchURL := in.HealthBase + "/v1/search?n=3&q=" + url.QueryEscape("SearXNG metasearch engine")
+	if !searches {
+		return nil
+	}
+	searchURL := in.HealthBase + "/v1/search?n=3&q=" + url.QueryEscape("holocron web search for AI agents")
 	resp, err := client.Get(searchURL)
 	if err != nil {
 		in.say("search: %v", err)
@@ -409,4 +595,25 @@ func (hostSystem) Run(ctx context.Context, w io.Writer, name string, args ...str
 	cmd := exec.CommandContext(ctx, name, args...)
 	cmd.Stdout, cmd.Stderr = w, w
 	return cmd.Run()
+}
+
+func (hostSystem) RunInput(ctx context.Context, w io.Writer, input []byte, name string, args ...string) error {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = bytes.NewReader(input), w, w
+	return cmd.Run()
+}
+
+func (hostSystem) Terminal(f *os.File) bool {
+	fi, err := f.Stat()
+	return err == nil && fi.Mode()&os.ModeCharDevice != 0
+}
+
+func (hostSystem) NoEcho(f *os.File) func() {
+	stty := func(arg string) {
+		cmd := exec.Command("stty", arg)
+		cmd.Stdin = f
+		cmd.Run()
+	}
+	stty("-echo")
+	return func() { stty("echo") }
 }

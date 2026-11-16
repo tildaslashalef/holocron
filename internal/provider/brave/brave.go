@@ -11,12 +11,10 @@ import (
 	"io"
 	"net/http"
 	"net/url"
-	"os"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/tildaslashalef/holocron/internal/provider"
@@ -25,8 +23,10 @@ import (
 // API is Brave's base URL.
 const API = "https://api.search.brave.com/res"
 
-// The holds after a failure that more calls cannot fix (§5.2).
+// The holds after a failure that more calls cannot fix (§5.2), and the
+// price of a request in micro-dollars: US$5 per 1,000 (§5.2).
 const (
+	price     = 5_000
 	keyHold   = 10 * time.Minute
 	quotaHold = time.Hour // when Brave gave no reset
 	maxBody   = 4 << 20
@@ -41,29 +41,23 @@ type Provider struct {
 	client    *http.Client
 	now       func() time.Time
 	sleep     func(ctx context.Context, d time.Duration) error
-	billed    atomic.Int64
+	meter     provider.Meter
+	hold      provider.Hold
 
-	mu         sync.Mutex
-	quota      provider.Quota
-	quotaAt    time.Time // when quota was read; zero before the first answer
-	heldUntil  time.Time
-	heldWhy    string
-	heldReason string
+	mu      sync.Mutex
+	quota   provider.Quota
+	quotaAt time.Time // when quota was read; zero before the first answer
 }
 
 // New reads the key from keyFile and returns a Provider that names itself
 // userAgent.
 func New(keyFile, userAgent string) (*Provider, error) {
 	if keyFile == "" {
-		return nil, errors.New("brave: --brave-key-file is required")
+		return nil, errors.New("brave: no key: --brave-key-file, or the brave-key credential")
 	}
-	b, err := os.ReadFile(keyFile)
+	key, err := provider.ReadKey("brave", keyFile)
 	if err != nil {
-		return nil, fmt.Errorf("brave: reading the key: %w", err)
-	}
-	key := strings.TrimSpace(string(b))
-	if key == "" || strings.ContainsAny(key, "\r\n") {
-		return nil, fmt.Errorf("brave: %s does not hold one key on one line", keyFile)
+		return nil, err
 	}
 	return newProvider(API, key, userAgent), nil
 }
@@ -74,7 +68,7 @@ func newProvider(base, key, userAgent string) *Provider {
 		base:      u,
 		key:       key,
 		userAgent: userAgent,
-		client:    &http.Client{Transport: &http.Transport{Proxy: nil, MaxIdleConns: 8, IdleConnTimeout: 60 * time.Second, ForceAttemptHTTP2: true}},
+		client:    provider.APIClient(),
 		now:       time.Now,
 		sleep:     sleep,
 	}
@@ -84,14 +78,11 @@ func (p *Provider) Name() string { return "brave" }
 
 // Health makes no call, since every call is billed: an error while a
 // refused key or a used-up quota holds calls back.
-func (p *Provider) Health(context.Context) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.now().Before(p.heldUntil) {
-		return &provider.UnavailableError{Msg: p.heldWhy, Reason: p.heldReason}
-	}
-	return nil
-}
+func (p *Provider) Health(context.Context) error { return p.hold.Err(p.now()) }
+
+// BudgetShare leaves the rest of a request's budget to the member after
+// Brave in a chain (§5.4).
+func (p *Provider) BudgetShare() float64 { return 0.6 }
 
 // Quota is the month's remaining requests from the last answer, the reset
 // counted down since.
@@ -107,7 +98,7 @@ func (p *Provider) Quota() (provider.Quota, bool) {
 }
 
 // Billed is the successful answers since start: what Brave bills.
-func (p *Provider) Billed() int64 { return p.billed.Load() }
+func (p *Provider) Billed() provider.Bill { return p.meter.Billed() }
 
 type webResponse struct {
 	Query struct {
@@ -142,7 +133,7 @@ func (p *Provider) Search(ctx context.Context, req provider.SearchRequest) (prov
 	if err := p.get(ctx, "v1/web/search", params, &r); err != nil {
 		return provider.Results{}, err
 	}
-	out := provider.Results{EnginesFailed: []string{}}
+	var out provider.Results
 	if a := strings.TrimSpace(r.Query.Altered); a != "" && a != req.Query {
 		out.AlteredQuery = a
 	}
@@ -152,12 +143,11 @@ func (p *Provider) Search(ctx context.Context, req provider.SearchRequest) (prov
 			extra = append(extra, html.UnescapeString(e))
 		}
 		out.Items = append(out.Items, provider.Result{
-			Title:         html.UnescapeString(it.Title),
-			URL:           it.URL,
-			Snippet:       html.UnescapeString(it.Description),
-			ExtraSnippets: extra,
-			Engine:        "brave",
-			Published:     isoDate(it.PageAge),
+			Title:     html.UnescapeString(it.Title),
+			URL:       it.URL,
+			Snippet:   html.UnescapeString(it.Description),
+			Snippets:  extra,
+			Published: isoDate(it.PageAge),
 		})
 	}
 	return out, nil
@@ -192,7 +182,7 @@ func (p *Provider) Context(ctx context.Context, req provider.ContextRequest) (pr
 	if err := p.get(ctx, "v1/llm/context", params, &r); err != nil {
 		return provider.Context{}, err
 	}
-	out := provider.Context{EnginesFailed: []string{}}
+	var out provider.Context
 	for _, g := range r.Grounding.Generic {
 		src := provider.Source{URL: g.URL, Title: html.UnescapeString(g.Title), Snippets: g.Snippets}
 		// age: a full date, YYYY-MM-DD, a relative age, an ISO timestamp.
@@ -239,13 +229,9 @@ func (e *errorBody) queryRefused() []string {
 // get asks Brave and decodes its JSON into v, mapping its failures to the
 // contract's (§5.2's table). A 429 with a second to wait is retried once.
 func (p *Provider) get(ctx context.Context, path string, params url.Values, v any) error {
-	p.mu.Lock()
-	if p.now().Before(p.heldUntil) {
-		err := &provider.UnavailableError{Msg: p.heldWhy, Reason: p.heldReason}
-		p.mu.Unlock()
+	if err := p.hold.Err(p.now()); err != nil {
 		return err
 	}
-	p.mu.Unlock()
 	u := p.base.JoinPath(path)
 	u.RawQuery = params.Encode()
 	for attempt := 0; ; attempt++ {
@@ -263,8 +249,9 @@ func (p *Provider) get(ctx context.Context, path string, params url.Values, v an
 		switch {
 		case status == http.StatusOK:
 			// Brave bills every successful answer, readable or not.
-			p.billed.Add(1)
-			provider.TraceOf(ctx).Bill(p.Name())
+			bill := provider.Bill{Units: 1, Micros: price}
+			p.meter.Add(bill)
+			provider.TraceOf(ctx).Bill(p.Name(), bill)
 			if err := json.Unmarshal(body, v); err != nil {
 				return &provider.UnavailableError{Msg: fmt.Sprintf("brave sent an unreadable answer: %v", err)}
 			}
@@ -277,7 +264,7 @@ func (p *Provider) get(ctx context.Context, path string, params url.Values, v an
 				if resetMonth > 0 {
 					hold = time.Duration(resetMonth) * time.Second
 				}
-				return p.hold(hold, provider.ReasonQuota, "brave: quota or credit used up")
+				return p.held(hold, provider.ReasonQuota, "brave: quota or credit used up")
 			}
 			wait := time.Duration(resetSecond) * time.Second
 			if attempt == 0 && second == 0 && wait <= maxRetry {
@@ -288,9 +275,9 @@ func (p *Provider) get(ctx context.Context, path string, params url.Values, v an
 			}
 			return &provider.UnavailableError{Msg: "brave: rate-limited" + detail(body), Reason: provider.ReasonRateLimited}
 		case status == http.StatusPaymentRequired:
-			return p.hold(quotaHold, provider.ReasonQuota, "brave: quota or credit used up"+detail(body))
+			return p.held(quotaHold, provider.ReasonQuota, "brave: quota or credit used up"+detail(body))
 		case status == http.StatusUnauthorized || status == http.StatusForbidden || eb.keyRefused():
-			return p.hold(keyHold, provider.ReasonKeyRefused, fmt.Sprintf("brave refused the key (%d)%s", status, detail(body)))
+			return p.held(keyHold, provider.ReasonKeyRefused, fmt.Sprintf("brave refused the key (%d)%s", status, detail(body)))
 		case (status == http.StatusBadRequest || status == http.StatusUnprocessableEntity) && len(eb.queryRefused()) > 0:
 			return &provider.BadQueryError{Msg: "brave refused the query: " + strings.Join(eb.queryRefused(), "; ")}
 		default:
@@ -352,13 +339,10 @@ func metered(h http.Header) bool {
 	return ok && limit > 0
 }
 
-// hold stops calls for d and returns the failure that explains it, with
+// held stops calls for d and returns the failure that explains it, with
 // its §10 reason.
-func (p *Provider) hold(d time.Duration, reason, why string) error {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.heldUntil, p.heldWhy, p.heldReason = p.now().Add(d), why, reason
-	return &provider.UnavailableError{Msg: why, Reason: reason}
+func (p *Provider) held(d time.Duration, reason, why string) error {
+	return p.hold.Set(p.now(), d, reason, why)
 }
 
 // limits parses an X-RateLimit header's "per-second, per-month" values;

@@ -59,7 +59,7 @@ func TestContext(t *testing.T) {
 		t.Fatalf("status %d", resp.StatusCode)
 	}
 	wantCache(t, resp, "miss", "")
-	if got.Query != "Zig http" || got.Provider != "brave" || len(got.Sources) != 2 || got.EnginesFailed == nil {
+	if got.Query != "Zig http" || got.Provider != "brave" || len(got.Sources) != 2 || got.ProvidersFailed == nil {
 		t.Fatalf("context = %+v", got)
 	}
 	s0, s1 := got.Sources[0], got.Sources[1]
@@ -117,30 +117,31 @@ func TestContextBudget(t *testing.T) {
 }
 
 func TestContextFailures(t *testing.T) {
-	// SearXNG alone: not_available, after validation, before the cache.
+	// A provider without context: not_available, after validation, before
+	// the cache.
 	h := newHarness(&fakeProvider{}, nil, true)
 	var eb ErrorBody
 	resp := h.do(t, http.MethodGet, "/v1/context?q=x", &eb)
 	if resp.StatusCode != 501 || eb.Error.Code != "not_available" ||
-		eb.Error.Message != "fake has no context endpoint; use /v1/search and /v1/fetch" || resp.Header.Get("X-Search-Cache") != "" {
+		eb.Error.Message != "no context provider is configured; use /v1/search and /v1/fetch" || resp.Header.Get("X-Search-Cache") != "" {
 		t.Errorf("not_available: %d %+v %v", resp.StatusCode, eb, resp.Header)
 	}
 	h.wantError(t, "/v1/context?q=", 400, "bad_request")
 
-	// No sources while engines failed is no_engines; an expired entry
+	// An unavailable provider is provider_unavailable; an expired entry
 	// answers it within 24 hours.
 	p := newContextProvider()
 	h = newHarness(p, nil, true)
 	c := h.clock()
 	h.do(t, http.MethodGet, "/v1/context?q=x", nil)
 	c.add(SearchTTL)
-	p.ans = provider.Context{EnginesFailed: []string{"brave"}}
+	p.err = &provider.UnavailableError{Msg: "brave: down"}
 	var got Context
 	wantCache(t, h.do(t, http.MethodGet, "/v1/context?q=x", &got), "stale", "1800")
 	if len(got.Sources) != 2 {
 		t.Errorf("stale: %+v", got)
 	}
-	h.wantError(t, "/v1/context?q=other", 503, "no_engines")
+	h.wantError(t, "/v1/context?q=other", 503, "provider_unavailable")
 	p.err = &provider.BadQueryError{Msg: "brave refused the query: too many words"}
 	h.wantError(t, "/v1/context?q=third", 400, "bad_request")
 	p.err = &provider.TimeoutError{Msg: "slow"}
@@ -150,16 +151,18 @@ func TestContextFailures(t *testing.T) {
 func TestHealthEndpointsAndQuota(t *testing.T) {
 	var got Health
 	newHarness(&fakeProvider{}, nil, true).do(t, http.MethodGet, "/v1/health", &got)
-	if !slices.Equal(got.Endpoints, []string{"/v1/search", "/v1/fetch"}) || got.Quota != nil {
-		t.Errorf("searxng alone: %+v", got)
+	if !slices.Equal(got.Endpoints, []string{"/v1/search", "/v1/fetch"}) || got.Quota != nil ||
+		!slices.Equal(got.Routes["/v1/fetch"], []string{"local"}) || got.Providers["local"] != "ok" {
+		t.Errorf("search only: %+v", got)
 	}
 
 	p := newContextProvider()
-	searx := &fakeProvider{health: errDown}
-	h := newHarness(provider.NewChain(p, searx), nil, true)
+	other := &fakeProvider{health: errDown}
+	h := newHarness(provider.NewChain(p, other), nil, true)
 	h.do(t, http.MethodGet, "/v1/health", &got)
 	if !slices.Equal(got.Endpoints, []string{"/v1/search", "/v1/context", "/v1/fetch"}) ||
-		got.Providers["brave"] != "ok" || got.Providers["fake"] != "down" || got.Quota != nil {
+		got.Providers["brave"] != "ok" || got.Providers["fake"] != "down" || got.Quota != nil ||
+		!slices.Equal(got.Routes["/v1/search"], []string{"brave", "fake"}) {
 		t.Errorf("chain: %+v", got)
 	}
 	p.quota = &provider.Quota{Remaining: 948, ResetsIn: 90 * time.Second}
@@ -172,15 +175,15 @@ func TestHealthEndpointsAndQuota(t *testing.T) {
 // A chain's answer names the provider that answered; the cache key is the
 // chain's.
 func TestSearchChainProvider(t *testing.T) {
-	brave := &fakeProvider{err: &provider.UnavailableError{Msg: "brave: down"}}
-	searx := &fakeProvider{res: results(2)}
-	h := newHarness(provider.NewChain(namedProvider{brave, "brave"}, namedProvider{searx, "searxng"}), nil, true)
+	first := &fakeProvider{err: &provider.UnavailableError{Msg: "parallel: down"}}
+	second := &fakeProvider{res: results(2)}
+	h := newHarness(provider.NewChain(namedProvider{first, "parallel"}, namedProvider{second, "brave"}), nil, true)
 	var s Search
 	h.do(t, http.MethodGet, "/v1/search?q=x", &s)
-	if s.Provider != "searxng" || !slices.Equal(s.EnginesFailed, []string{"brave"}) || s.Results[0].Engine != "e" {
+	if s.Provider != "brave" || !slices.Equal(s.ProvidersFailed, []string{"parallel"}) || len(s.Results) != 2 {
 		t.Errorf("search = %+v", s)
 	}
-	if !strings.Contains(h.logged(), "provider=brave,searxng") {
+	if !strings.Contains(h.logged(), "provider=parallel,brave") {
 		t.Errorf("log:\n%s", h.logged())
 	}
 }
@@ -205,7 +208,9 @@ type traceProvider struct {
 	billed atomic.Int64
 }
 
-func (p *traceProvider) Billed() int64 { return p.billed.Load() }
+func (p *traceProvider) Billed() provider.Bill {
+	return provider.Bill{Units: p.billed.Load(), Micros: p.billed.Load() * 5000}
+}
 
 // answer records what Brave would: the quota and, on success, a bill.
 func (p *traceProvider) answer(ctx context.Context) {
@@ -217,7 +222,7 @@ func (p *traceProvider) answer(ctx context.Context) {
 	}
 	if p.err == nil {
 		p.billed.Add(1)
-		provider.TraceOf(ctx).Bill(p.name)
+		provider.TraceOf(ctx).Bill(p.name, provider.Bill{Units: 1, Micros: 5000})
 	}
 }
 
@@ -236,7 +241,7 @@ func (p *traceProvider) Context(ctx context.Context, r provider.ContextRequest) 
 // Brave's quota from this request's answer.
 func TestLogAnsweredBy(t *testing.T) {
 	brave := &traceProvider{name: "brave", res: results(3), quota: &provider.Quota{Remaining: 948, ResetsIn: 90 * time.Second}}
-	searx := &traceProvider{name: "searxng", res: provider.Results{Items: results(2).Items, EnginesFailed: []string{"duckduckgo", "mojeek"}}}
+	searx := &traceProvider{name: "parallel", res: results(2)}
 	h := newHarness(provider.NewChain(brave, searx), nil, false)
 	h.clock()
 	line := func() string {
@@ -259,32 +264,32 @@ func TestLogAnsweredBy(t *testing.T) {
 	}
 
 	h.do(t, http.MethodGet, "/v1/search?q=private+words&n=2", nil)
-	want(line(), []string{"provider=brave,searxng answered_by=brave results=2 brave_billed=1 brave_remaining=948 brave_resets_in_s=90", "cache=miss"},
-		[]string{"fallback=", "engines_failed=", "private"})
+	want(line(), []string{"provider=brave,parallel answered_by=brave results=2 brave_billed=1 brave_cost_usd=0.005000 brave_remaining=948 brave_resets_in_s=90", "cache=miss"},
+		[]string{"fallback=", "providers_failed=", "private"})
 
 	// A hit: how it was answered, and no call.
 	h.do(t, http.MethodGet, "/v1/search?q=private+words", nil)
 	want(line(), []string{"answered_by=brave results=3", "cache=hit"}, []string{"brave_remaining", "brave_billed", "fallback="})
 
-	// Brave's quota used up: SearXNG answers.
+	// Brave's quota used up: the next answers.
 	brave.err, brave.quota = &provider.UnavailableError{Msg: "brave: quota or credit used up", Reason: provider.ReasonQuota}, nil
 	h.do(t, http.MethodGet, "/v1/search?q=other", nil)
-	want(line(), []string{"answered_by=searxng fallback=brave:quota results=2 engines_failed=brave,duckduckgo,mojeek"}, []string{"brave_remaining", "brave_billed"})
+	want(line(), []string{"answered_by=parallel fallback=brave:quota results=2 providers_failed=brave parallel_billed=1"}, []string{"brave_remaining", "brave_billed"})
 
 	// Both fail: the error, and the fallback that led to it.
 	brave.err = &provider.UnavailableError{Msg: "brave refused the key", Reason: provider.ReasonKeyRefused}
-	searx.err = &provider.UnavailableError{Msg: "searxng: down"}
+	searx.err = &provider.UnavailableError{Msg: "parallel: down"}
 	h.do(t, http.MethodGet, "/v1/search?q=third", nil)
-	want(line(), []string{"code=no_engines", "fallback=brave:key_refused"}, []string{"answered_by", "results="})
+	want(line(), []string{"code=provider_unavailable", "fallback=brave:key_refused"}, []string{"answered_by", "results="})
 
 	// Context.
 	brave.err, brave.quota = nil, &provider.Quota{Remaining: 947, ResetsIn: time.Minute}
 	h.do(t, http.MethodGet, "/v1/context?q=x", nil)
-	want(line(), []string{"endpoint=/v1/context", "answered_by=brave results=1 brave_billed=1 brave_remaining=947 brave_resets_in_s=60"}, nil)
+	want(line(), []string{"endpoint=/v1/context", "answered_by=brave results=1 brave_billed=1 brave_cost_usd=0.005000 brave_remaining=947 brave_resets_in_s=60"}, nil)
 
 	var hl Health
 	h.do(t, http.MethodGet, "/v1/health", &hl)
-	if hl.Billed["brave"] != 2 || hl.Billed["searxng"] != 1 {
+	if hl.Billed["brave"] != 2 || hl.Billed["parallel"] != 1 {
 		t.Errorf("health billed = %+v", hl.Billed)
 	}
 }
@@ -293,8 +298,8 @@ func TestLogAnsweredBy(t *testing.T) {
 // bill.
 func TestLogBilledOncePerSharedCall(t *testing.T) {
 	brave := &traceProvider{name: "brave", res: results(3), block: make(chan struct{})}
-	h := newHarness(provider.NewChain(brave, &traceProvider{name: "searxng"}), nil, true)
-	key := searchKey("brave,searxng", "shared", "")
+	h := newHarness(provider.NewChain(brave, &traceProvider{name: "parallel"}), nil, true)
+	key := searchKey("brave,parallel", "shared", "")
 	var wg sync.WaitGroup
 	for range 3 {
 		wg.Go(func() {
@@ -313,10 +318,10 @@ func TestLogBilledOncePerSharedCall(t *testing.T) {
 // §3.2 and §3.5: freshness is validated, passed on and part of the key;
 // results carry extra_snippets within bounds; altered_query says what was
 // searched.
-func TestFreshnessExtraSnippetsAltered(t *testing.T) {
+func TestFreshnessSnippetsAltered(t *testing.T) {
 	long := strings.Repeat("word ", 150)
 	p := &freshProvider{res: provider.Results{AlteredQuery: "zig std.http", Items: []provider.Result{
-		{URL: "https://a.example/", Title: "A", ExtraSnippets: []string{" one \n two ", "", long, "3", "4", "5", "6"}},
+		{URL: "https://a.example/", Title: "A", Snippets: []string{" one \n two ", "", long, "3", "4", "5", "6"}},
 		{URL: "https://b.example/", Title: "B"},
 	}}}
 	h := newHarness(p, nil, true)
@@ -325,13 +330,13 @@ func TestFreshnessExtraSnippetsAltered(t *testing.T) {
 	if p.last.Freshness != "pw" || s.AlteredQuery == nil || *s.AlteredQuery != "zig std.http" {
 		t.Errorf("search: %+v, request %+v", s, p.last)
 	}
-	e := s.Results[0].ExtraSnippets
-	if len(e) != MaxExtraSnippets || e[0] != "one two" || len([]rune(e[1])) > MaxSnippet || !strings.HasSuffix(e[1], "…") || e[4] != "5" {
+	e := s.Results[0].Snippets
+	if len(e) != MaxSnippets || e[0] != "one two" || len([]rune(e[1])) > MaxSnippet || !strings.HasSuffix(e[1], "…") || e[4] != "5" {
 		t.Errorf("extra snippets = %q", e)
 	}
 	var raw map[string]any
 	h.do(t, http.MethodGet, "/v1/search?q=zig+std.htpp&freshness=pw", &raw)
-	if r1 := raw["results"].([]any)[1].(map[string]any); r1["extra_snippets"] == nil || len(r1["extra_snippets"].([]any)) != 0 {
+	if r1 := raw["results"].([]any)[1].(map[string]any); r1["snippets"] == nil || len(r1["snippets"].([]any)) != 0 {
 		t.Errorf("no extra snippets is not an empty list: %v", r1)
 	}
 	if p.calls != 1 {

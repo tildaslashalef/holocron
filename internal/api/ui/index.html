@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>holocron</title>
+<link rel="icon" href="/ui/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/ui/app.css">
+<script src="/ui/app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <svg class="mark" viewBox="0 0 32 32" aria-hidden="true"><use href="/ui/icon.svg#cube"></use></svg>
+    <div>
+      <h1>holocron</h1>
+      <p class="sub" id="sub">connecting…</p>
+    </div>
+  </div>
+  <div class="live" id="live" role="status" aria-live="polite"><span class="dot"></span><span id="live-text">waiting for data</span></div>
+</header>
+
+<main>
+  <section class="routes" id="routes" aria-label="Routes"></section>
+
+  <section class="kpis" id="kpis" aria-label="Last 24 hours"></section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Traffic</h2>
+      <div class="legend" id="legend"></div>
+    </div>
+    <div class="chart" id="chart">
+      <div class="tip" id="tip" hidden></div>
+    </div>
+    <div class="axis" id="axis"></div>
+  </section>
+
+  <section aria-label="Providers">
+    <h2 class="section-title">Providers</h2>
+    <div class="providers" id="providers"></div>
+  </section>
+
+  <div class="grid-2">
+    <section class="panel">
+      <h2>Endpoints</h2>
+      <table class="table" id="endpoints">
+        <thead><tr><th>Endpoint</th><th class="num">Requests</th><th class="num">Errors</th><th class="num">Cache</th><th class="num">p50</th><th class="num">p95</th></tr></thead>
+        <tbody></tbody>
+      </table>
+      <div class="codes" id="codes"></div>
+    </section>
+    <section class="panel">
+      <h2>Cache &amp; capacity</h2>
+      <div id="cache"></div>
+      <div id="capacity"></div>
+    </section>
+  </div>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>Recent requests</h2>
+      <span class="hint" id="recent-hint"></span>
+    </div>
+    <div class="table-wrap">
+      <table class="table recent" id="recent">
+        <thead><tr><th>When</th><th>Endpoint</th><th>Query or page</th><th>Answered by</th><th>Cache</th><th class="num">Result</th><th class="num">Time</th><th class="num">Cost</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </section>
+</main>
+
+<footer class="foot">
+  <span id="foot">A live view of this process: it resets when holocron restarts. History is in your metrics store, from <code>/v1/metrics</code>.</span>
+</footer>
+<noscript><p class="noscript">The dashboard needs JavaScript; the same numbers are at <code>/v1/stats</code>.</p></noscript>
+</body>
+</html>

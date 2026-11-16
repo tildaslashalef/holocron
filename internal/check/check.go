@@ -21,10 +21,12 @@ import (
 // The public pages the suite uses (§12): a failure names its site, so an
 // outage elsewhere is told apart from a bug in holocron.
 const (
-	PEP8         = "https://peps.python.org/pep-0008/"
-	PDF          = "https://www.rfc-editor.org/rfc/rfc9110.pdf"
-	NotFound     = "https://go.dev/holocron-check-missing-page"
-	RedirectSite = "https://httpbin.org/redirect-to?url=http%3A%2F%2F192.168.1.1%2F"
+	PEP8     = "https://peps.python.org/pep-0008/"
+	PDF      = "https://www.rfc-editor.org/rfc/rfc9110.pdf"
+	NotFound = "https://go.dev/holocron-check-missing-page"
+	// RedirectSite redirects to a private address. httpbin.org and
+	// httpbingo.org refuse such redirects since 2026-11.
+	RedirectSite = "https://postman-echo.com/redirect-to?url=http%3A%2F%2F192.168.1.1%2F"
 	SearchQuery  = "zig std.http.Client"
 )
 
@@ -34,7 +36,6 @@ var Blocked = []string{
 	"http://nas.home.arpa:8443/",
 	"http://127.0.0.1:8888/",
 	"http://192.168.1.1.nip.io/",
-	RedirectSite,
 }
 
 // Run runs every check against base (e.g. http://127.0.0.1:8080) and
@@ -46,14 +47,31 @@ func Run(ctx context.Context, base, userAgent string, out io.Writer) error {
 		http: &http.Client{Timeout: 30 * time.Second, Transport: &http.Transport{Proxy: nil}},
 		out:  out,
 	}
-	endpoints := c.health(ctx)
-	c.search(ctx)
-	c.context(ctx, endpoints)
-	c.fetchPEP8(ctx)
+	h := c.health(ctx)
+	c.search(ctx, h.Endpoints)
+	c.context(ctx, h.Endpoints)
+	fetcher := ""
+	if f := h.Routes["/v1/fetch"]; len(f) > 0 {
+		fetcher = f[0]
+	}
+	c.fetchPEP8(ctx, fetcher)
 	for _, u := range Blocked {
 		c.wantError(ctx, "guard "+u, "/v1/fetch?url="+url.QueryEscape(u), "blocked_address", http.StatusForbidden)
 	}
-	c.wantError(ctx, "pdf ("+host(PDF)+")", "/v1/fetch?url="+url.QueryEscape(PDF), "unsupported_content", http.StatusUnsupportedMediaType)
+	// A redirect is the local fetcher's to refuse. A remote extractor
+	// follows it from its own network, where 192.168.1.1 is not ours: the
+	// check is only that it does not answer with a page.
+	if fetcher == "local" {
+		c.wantError(ctx, "guard "+RedirectSite, "/v1/fetch?url="+url.QueryEscape(RedirectSite), "blocked_address", http.StatusForbidden)
+	} else {
+		c.wantFailure(ctx, "redirect to 192.168.1.1, followed by "+fetcher, "/v1/fetch?url="+url.QueryEscape(RedirectSite))
+	}
+	if fetcher == "local" {
+		c.wantError(ctx, "pdf ("+host(PDF)+")", "/v1/fetch?url="+url.QueryEscape(PDF), "unsupported_content", http.StatusUnsupportedMediaType)
+	} else {
+		c.fetchPDF(ctx)
+		c.fetchFocused(ctx)
+	}
 	c.wantError(ctx, "404 ("+host(NotFound)+")", "/v1/fetch?url="+url.QueryEscape(NotFound), "upstream_failed", http.StatusBadGateway)
 	c.wantError(ctx, "port 8443", "/v1/fetch?url="+url.QueryEscape("https://example.org:8443/"), "bad_request", http.StatusBadRequest)
 	if c.failed > 0 {
@@ -121,8 +139,8 @@ func (c *checker) getOK(ctx context.Context, path string, v any) error {
 	return nil
 }
 
-// health checks /v1/health and returns the endpoints it lists.
-func (c *checker) health(ctx context.Context) []string {
+// health checks /v1/health and returns it.
+func (c *checker) health(ctx context.Context) api.Health {
 	var h api.Health
 	err := c.getOK(ctx, "/v1/health", &h)
 	if err == nil {
@@ -135,8 +153,8 @@ func (c *checker) health(ctx context.Context) []string {
 			}
 		}
 	}
-	c.report(fmt.Sprintf("health (version %s)", h.Version), err)
-	return h.Endpoints
+	c.report(fmt.Sprintf("health (version %s, fetch %v)", h.Version, h.Routes["/v1/fetch"]), err)
+	return h
 }
 
 // context checks §3.5 when health lists it, else its not_available.
@@ -152,15 +170,15 @@ func (c *checker) context(ctx context.Context, endpoints []string) {
 		err = contextBounded(a, api.DefaultTokens)
 	}
 	if err == nil && len(a.Sources) == 0 {
-		err = fmt.Errorf("no sources (engines failed: %v)", a.EnginesFailed)
+		err = fmt.Errorf("no sources (providers failed: %v)", a.ProvidersFailed)
 	}
 	c.report(fmt.Sprintf("context %q: %d sources", SearchQuery, len(a.Sources)), err)
 }
 
 // contextBounded checks every field of a context answer against §3.5.
 func contextBounded(a api.Context, tokens int) error {
-	if a.Provider == "" || a.EnginesFailed == nil || a.Sources == nil {
-		return fmt.Errorf("provider, sources or engines_failed missing")
+	if a.Provider == "" || a.ProvidersFailed == nil || a.Sources == nil {
+		return fmt.Errorf("provider, sources or providers_failed missing")
 	}
 	seen := map[string]bool{}
 	total, snippets := 0, 0
@@ -195,15 +213,19 @@ func contextBounded(a api.Context, tokens int) error {
 
 var isoDate = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
 
-func (c *checker) search(ctx context.Context) {
+func (c *checker) search(ctx context.Context, endpoints []string) {
 	q := "/v1/search?q=" + url.QueryEscape(SearchQuery)
+	if !slices.Contains(endpoints, "/v1/search") {
+		c.wantError(ctx, "search without a provider", q, "not_available", http.StatusNotImplemented)
+		return
+	}
 	var s api.Search
 	err := c.getOK(ctx, q, &s)
 	if err == nil {
 		err = bounded(s)
 	}
 	if err == nil && len(s.Results) < 3 {
-		err = fmt.Errorf("%d results, want at least 3 (engines failed: %v)", len(s.Results), s.EnginesFailed)
+		err = fmt.Errorf("%d results, want at least 3 (providers failed: %v)", len(s.Results), s.ProvidersFailed)
 	}
 	c.report(fmt.Sprintf("search %q: %d results", SearchQuery, len(s.Results)), err)
 
@@ -222,8 +244,8 @@ func (c *checker) search(ctx context.Context) {
 
 // bounded checks every field of a search answer against §3.2.
 func bounded(s api.Search) error {
-	if s.Provider == "" || s.EnginesFailed == nil || s.Results == nil {
-		return fmt.Errorf("provider, results or engines_failed missing")
+	if s.Provider == "" || s.ProvidersFailed == nil || s.Results == nil {
+		return fmt.Errorf("provider, results or providers_failed missing")
 	}
 	seen := map[string]bool{}
 	for i, r := range s.Results {
@@ -237,8 +259,8 @@ func bounded(s api.Search) error {
 			return fmt.Errorf("result %d: title longer than %d", i, api.MaxTitle)
 		case utf8.RuneCountInString(r.Snippet) > api.MaxSnippet:
 			return fmt.Errorf("result %d: snippet longer than %d", i, api.MaxSnippet)
-		case r.Engine == "":
-			return fmt.Errorf("result %d: no engine", i)
+		case r.Snippets == nil || len(r.Snippets) > api.MaxSnippets:
+			return fmt.Errorf("result %d: snippets missing or more than %d", i, api.MaxSnippets)
 		case r.Published != nil && !isoDate.MatchString(*r.Published):
 			return fmt.Errorf("result %d: published %q is not an ISO date", i, *r.Published)
 		}
@@ -247,7 +269,7 @@ func bounded(s api.Search) error {
 	return nil
 }
 
-func (c *checker) fetchPEP8(ctx context.Context) {
+func (c *checker) fetchPEP8(ctx context.Context, fetcher string) {
 	name := "fetch " + host(PEP8)
 	base := "/v1/fetch?url=" + url.QueryEscape(PEP8)
 	var first, next, both api.Fetch
@@ -256,15 +278,17 @@ func (c *checker) fetchPEP8(ctx context.Context) {
 		switch n := utf8.RuneCountInString(first.Text); {
 		case n != 2000:
 			err = fmt.Errorf("%d characters, want 2000", n)
-		case !strings.HasPrefix(first.Text, "#"):
+		case fetcher == "local" && !strings.HasPrefix(first.Text, "#"):
 			err = fmt.Errorf("does not start with a heading: %.60q", first.Text)
+		case first.Provider == "":
+			err = fmt.Errorf("no provider")
 		case first.Chars <= 2000:
 			err = fmt.Errorf("chars %d, want more than 2000", first.Chars)
 		case !first.Truncated:
 			err = fmt.Errorf("not truncated")
 		}
 	}
-	c.report(fmt.Sprintf("%s: 2000 of %d characters", name, first.Chars), err)
+	c.report(fmt.Sprintf("%s: 2000 of %d characters, by %s", name, first.Chars, first.Provider), err)
 
 	err = c.getOK(ctx, base+"&start=2000&max_chars=2000", &next)
 	if err == nil {
@@ -276,6 +300,29 @@ func (c *checker) fetchPEP8(ctx context.Context) {
 	c.report(name+": start=2000 pages on", err)
 }
 
+// fetchPDF checks that an extraction provider reads a PDF (§3.3).
+func (c *checker) fetchPDF(ctx context.Context) {
+	var f api.Fetch
+	err := c.getOK(ctx, "/v1/fetch?max_chars=500&url="+url.QueryEscape(PDF), &f)
+	if err == nil && (f.Chars < 1000 || f.Text == "") {
+		err = fmt.Errorf("%d characters", f.Chars)
+	}
+	c.report(fmt.Sprintf("pdf (%s): %d characters, by %s", host(PDF), f.Chars, f.Provider), err)
+}
+
+// fetchFocused checks a fetch with q: the parts of the page that answer it.
+func (c *checker) fetchFocused(ctx context.Context) {
+	var f api.Fetch
+	err := c.getOK(ctx, "/v1/fetch?q="+url.QueryEscape("maximum line length")+"&url="+url.QueryEscape(PEP8), &f)
+	if err == nil && (!f.Focused || f.Text == "") {
+		err = fmt.Errorf("focused %v, %d characters", f.Focused, f.Chars)
+	}
+	if err == nil && !strings.Contains(f.Text, "79") {
+		err = fmt.Errorf("the excerpts do not mention 79 characters")
+	}
+	c.report(fmt.Sprintf("fetch %s with q: %d characters, by %s", host(PEP8), f.Chars, f.Provider), err)
+}
+
 // wantError checks that path answers code with status.
 func (c *checker) wantError(ctx context.Context, name, path, code string, status int) {
 	got, eb, err := c.get(ctx, path, &json.RawMessage{})
@@ -285,6 +332,19 @@ func (c *checker) wantError(ctx context.Context, name, path, code string, status
 		err = fmt.Errorf("status %d, want %d %s", got, status, code)
 	case eb.Error.Code != code || got != status:
 		err = fmt.Errorf("%d %s (%s), want %d %s", got, eb.Error.Code, eb.Error.Message, status, code)
+	}
+	c.report(fmt.Sprintf("%s → %s", name, code), err)
+}
+
+// wantFailure checks that path answers an error, whichever.
+func (c *checker) wantFailure(ctx context.Context, name, path string) {
+	got, eb, err := c.get(ctx, path, &json.RawMessage{})
+	if err == nil && eb == nil {
+		err = fmt.Errorf("status %d, want an error", got)
+	}
+	code := ""
+	if eb != nil {
+		code = eb.Error.Code
 	}
 	c.report(fmt.Sprintf("%s → %s", name, code), err)
 }

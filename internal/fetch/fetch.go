@@ -26,7 +26,7 @@ const (
 	MaxURL       = 2048
 	MaxBody      = 5 << 20
 	MaxRedirects = 5
-	Budget       = 20 * time.Second
+	Budget       = 25 * time.Second
 )
 
 // UnsupportedError is a response whose type §3.3 does not extract

@@ -9,17 +9,17 @@ import (
 	"time"
 
 	"github.com/tildaslashalef/holocron/internal/cache"
-	"github.com/tildaslashalef/holocron/internal/fetch"
 	"github.com/tildaslashalef/holocron/internal/provider"
 )
 
 // The cache (§8.1).
 const (
 	SearchTTL         = 30 * time.Minute
-	SearchPartialTTL  = 5 * time.Minute // when engines failed
-	StaleMax          = 24 * time.Hour  // a search kept for no_engines
+	SearchPartialTTL  = 5 * time.Minute // when a provider failed before the one that answered
+	StaleMax          = 24 * time.Hour  // a search kept for provider_unavailable
 	FetchTTL          = 15 * time.Minute
-	FailTTL           = time.Minute // a fetch's upstream_failed, unsupported_content
+	FocusTTL          = 30 * time.Minute // a fetch with q, like a search
+	FailTTL           = time.Minute      // a fetch's upstream_failed, unsupported_content
 	SearchCacheBytes  = 8 << 20
 	ContextCacheBytes = 8 << 20
 	FetchCacheBytes   = 48 << 20
@@ -49,7 +49,7 @@ type caches struct {
 	pages        *cache.LRU[pageEntry]
 	searchCalls  cache.Group[traced[*Search]]
 	contextCalls cache.Group[traced[*Context]]
-	fetchCalls   cache.Group[*fetch.Page]
+	fetchCalls   cache.Group[traced[pageEntry]]
 	now          func() time.Time
 }
 
@@ -60,9 +60,12 @@ type traced[T any] struct {
 	trace *provider.Trace
 }
 
-// pageEntry is a fetched document or a failure kept for FailTTL.
+// pageEntry is an extracted document, who answered it and what it cost,
+// or a failure kept for FailTTL.
 type pageEntry struct {
-	page *fetch.Page
+	page *provider.Page
+	by   provider.Answered
+	cost int64
 	err  error
 }
 
@@ -73,6 +76,17 @@ func newCaches() *caches {
 		pages:    cache.NewLRU[pageEntry](FetchCacheBytes),
 		now:      time.Now,
 	}
+}
+
+// kinds are the caches by §8.2's kind label, for the metrics and stats.
+func (c *caches) kinds() []struct {
+	kind string
+	len  func() (int, int64)
+} {
+	return []struct {
+		kind string
+		len  func() (int, int64)
+	}{{"search", c.searches.Len}, {"context", c.contexts.Len}, {"fetch", c.pages.Len}}
 }
 
 func (c *caches) stats() *CacheStats {
@@ -96,6 +110,12 @@ func fetchKey(u *url.URL) string {
 	k.Host = strings.ToLower(k.Host)
 	k.Fragment, k.RawFragment = "", ""
 	return k.String()
+}
+
+// pageKey is a fetch's entry: the fetch chain, the URL's key, and the
+// question collapsed and lowercased ("" for the whole page).
+func pageKey(chain string, u *url.URL, focus string) string {
+	return chain + "\x00" + fetchKey(u) + "\x00" + strings.ToLower(collapse(focus))
 }
 
 // noCache reports a request's Cache-Control: no-cache.
@@ -122,15 +142,15 @@ func (s *Search) slice(query string, n int) *Search {
 func (s *Search) size() int64 {
 	n := entryOverhead + len(s.Provider)
 	for _, r := range s.Results {
-		n += 64 + len(r.Title) + len(r.URL) + len(r.Snippet) + len(r.Engine)
+		n += 64 + len(r.Title) + len(r.URL) + len(r.Snippet)
 		if r.Published != nil {
 			n += len(*r.Published)
 		}
-		for _, e := range r.ExtraSnippets {
+		for _, e := range r.Snippets {
 			n += 16 + len(e)
 		}
 	}
-	for _, e := range s.EnginesFailed {
+	for _, e := range s.ProvidersFailed {
 		n += 16 + len(e)
 	}
 	return int64(n)
@@ -154,14 +174,24 @@ func (c *Context) size() int64 {
 			n += 16 + len(sn)
 		}
 	}
-	for _, e := range c.EnginesFailed {
+	for _, e := range c.ProvidersFailed {
 		n += 16 + len(e)
 	}
 	return int64(n)
 }
 
-func pageSize(p *fetch.Page) int64 {
-	return int64(entryOverhead + len(p.URL) + len(p.FinalURL) + len(p.ContentType) + len(p.Title) + len(p.Text))
+func pageSize(e pageEntry) int64 {
+	n := entryOverhead + len(e.by.Provider)
+	for _, f := range e.by.Failed {
+		n += 16 + len(f)
+	}
+	if p := e.page; p != nil {
+		n += len(p.URL) + len(p.FinalURL) + len(p.ContentType) + len(p.Title) + len(p.Published) + len(p.Text)
+	}
+	if e.err != nil {
+		n += len(e.err.Error())
+	}
+	return int64(n)
 }
 
 // waited maps a shared call's result for one request: the request ending

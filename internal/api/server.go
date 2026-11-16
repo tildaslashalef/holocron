@@ -24,58 +24,60 @@ import (
 
 // Serving limits (§8).
 const (
-	Slots         = 8
+	Slots         = 32 // upstream calls in flight; local extraction has its own (ExtractSlots)
+	ExtractSlots  = 4
 	SlotWait      = 2 * time.Second
 	SearchBudget  = 10 * time.Second
 	ContextBudget = 20 * time.Second
+	FetchBudget   = fetch.Budget
 	HealthTimeout = 3 * time.Second
 )
 
-// Fetcher is what /v1/fetch needs of fetch.Client.
-type Fetcher interface {
-	Fetch(ctx context.Context, raw string, done func()) (*fetch.Page, error)
+// Options configure NewServer.
+type Options struct {
+	Version    string
+	Routes     provider.Routes
+	Log        *slog.Logger
+	LogQueries bool // false: the log and the stats keep hosts, not queries or URLs (§10)
+	Dashboard  bool // serve the dashboard at / and /v1/stats (§8.3)
 }
 
-// Server is the v1 handler. Search and fetch share Slots request slots;
-// health takes none.
+// Server is the v1 handler. Upstream calls share Slots request slots;
+// health, metrics, stats and the dashboard take none.
 type Server struct {
 	version    string
-	provider   provider.Provider
-	fetcher    Fetcher
+	routes     provider.Routes
 	log        *slog.Logger
 	logQueries bool
+	dashboard  bool
 	slots      chan struct{}
 	slotWait   time.Duration
 	cache      *caches
 	metrics    *serverMetrics
-	// searxngImage is the pin §8.2's build info reports.
-	searxngImage string
+	stats      *stats
 }
 
-// NewServer returns the handler. With logQueries false the log keeps the
-// host but not the query or the URLs (§10).
-func NewServer(version string, p provider.Provider, f Fetcher, log *slog.Logger, logQueries bool) *Server {
+// NewServer returns the handler.
+func NewServer(o Options) *Server {
 	return &Server{
-		version:    version,
-		provider:   p,
-		fetcher:    f,
-		log:        log,
-		logQueries: logQueries,
+		version:    o.Version,
+		routes:     o.Routes,
+		log:        o.Log,
+		logQueries: o.LogQueries,
+		dashboard:  o.Dashboard,
 		slots:      make(chan struct{}, Slots),
 		slotWait:   SlotWait,
 		cache:      newCaches(),
 		metrics:    newServerMetrics(),
+		stats:      newStats(time.Now()),
 	}
 }
-
-// SetSearXNGImage names the SearXNG pin in §8.2's build info.
-func (s *Server) SetSearXNGImage(image string) { s.searxngImage = image }
 
 // entry is one request's log line, filled in by its handler.
 type entry struct {
 	status   int
 	code     string
-	provider string
+	provider string // the endpoint's chain
 	host     string
 	query    string
 	url      string
@@ -84,24 +86,25 @@ type entry struct {
 	message  string // the error answer's message
 	detail   string // for internal errors
 
-	// How a search or context was answered (§10).
-	answeredBy    string
-	results       int
-	enginesFailed []string
-	trace         *provider.Trace
+	// How a search, context or fetch was answered (§10).
+	answeredBy      string
+	results         int
+	providersFailed []string
+	trace           *provider.Trace
+	saved           int64 // a hit's or stale answer's cost of its call, in micro-dollars
 	// For the request that claimed its call's trace: what happened once
 	// per call.
 	firstOfCall bool
-	billed      map[string]int
+	billed      map[string]provider.Bill
 }
 
-// answered records a search or context answer for the log line.
-func (e *entry) answered(by string, results int, enginesFailed []string) {
-	e.answeredBy, e.results, e.enginesFailed = by, results, enginesFailed
+// answered records an answer for the log line.
+func (e *entry) answered(by string, results int, failed []string) {
+	e.answeredBy, e.results, e.providersFailed = by, results, failed
 }
 
 // answer is what a handler returns: a body to encode, or an error; and
-// for a search or fetch past validation, how the cache answered (§8.1).
+// for a request past validation, how the cache answered (§8.1).
 type answer struct {
 	body   any
 	err    error
@@ -110,10 +113,19 @@ type answer struct {
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// §8.2: no slot, no cache, not logged or counted.
-	if r.URL.Path == "/v1/metrics" && r.Method == http.MethodGet {
-		s.serveMetrics(w, r)
-		return
+	// §8.2, §8.3: no slot, no cache, not logged or counted.
+	if r.Method == http.MethodGet {
+		switch {
+		case r.URL.Path == "/v1/metrics":
+			s.serveMetrics(w, r)
+			return
+		case s.dashboard && r.URL.Path == "/v1/stats":
+			s.serveStats(w, r)
+			return
+		case s.dashboard && isAsset(r.URL.Path):
+			serveAsset(w, r)
+			return
+		}
 	}
 	start := time.Now()
 	e := &entry{}
@@ -151,6 +163,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	d := time.Since(start)
 	s.logRequest(r, e, d)
 	s.metrics.record(r, e, d)
+	s.stats.record(r, e, d, s.logQueries)
 }
 
 // dispatch routes and recovers: a panic is internal, and the process keeps
@@ -178,17 +191,27 @@ func (s *Server) dispatch(r *http.Request, e *entry) (a answer) {
 	return answer{err: &Error{"not_found", http.StatusNotFound, r.URL.Path + " is not part of the contract"}}
 }
 
-func (s *Server) search(r *http.Request, e *entry) answer {
-	name := s.provider.Name()
-	e.provider = name
-	q := r.URL.Query()
+// queryParam reads and bounds q (§3.2).
+func queryParam(q url.Values) (string, error) {
 	query := strings.TrimSpace(q.Get("q"))
-	e.query = query
 	if query == "" {
-		return answer{err: badRequest("q is empty")}
+		return "", badRequest("q is empty")
 	}
 	if len(query) > MaxQuery {
-		return answer{err: badRequest(fmt.Sprintf("q is longer than %d bytes", MaxQuery))}
+		return "", badRequest(fmt.Sprintf("q is longer than %d bytes", MaxQuery))
+	}
+	return query, nil
+}
+
+func (s *Server) search(r *http.Request, e *entry) answer {
+	chain := s.routes.Search
+	name := chain.Name()
+	e.provider = name
+	q := r.URL.Query()
+	e.query = strings.TrimSpace(q.Get("q"))
+	query, err := queryParam(q)
+	if err != nil {
+		return answer{err: err}
 	}
 	n, err := intParam(q, "n", DefaultN, 1, MaxN)
 	if err != nil {
@@ -198,39 +221,45 @@ func (s *Server) search(r *http.Request, e *entry) answer {
 	if err != nil {
 		return answer{err: err}
 	}
+	if !chain.CanSearch() {
+		return answer{err: &provider.NotAvailableError{Msg: "no search provider is configured (a provider needs its key, §5.5)"}}
+	}
 
 	c := s.cache
 	key := searchKey(name, query, freshness)
 	out, how, stored, trace, err := cachedCall(s, r, c.searches, &c.searchCalls, key, SearchBudget,
 		func(ctx context.Context) (*Search, error) {
 			// Every n is a slice of the 10 results kept.
-			res, err := s.provider.Search(ctx, provider.SearchRequest{Query: query, N: MaxN, Freshness: freshness})
+			res, by, err := chain.Search(ctx, provider.SearchRequest{Query: query, N: MaxN, Freshness: freshness})
 			if err != nil {
 				return nil, err
 			}
-			return NewSearch(query, name, res, MaxN)
+			out := NewSearch(query, res, by, MaxN)
+			out.cost = provider.TraceOf(ctx).Cost()
+			return out, nil
 		},
-		func(v *Search) (int64, bool) { return v.size(), len(v.EnginesFailed) > 0 })
+		func(v *Search) (int64, bool) { return v.size(), len(v.ProvidersFailed) > 0 })
 	e.trace = trace
 	if err != nil {
 		return answer{err: err, cache: how}
 	}
 	body := out.slice(query, n)
-	e.answered(body.Provider, len(body.Results), body.EnginesFailed)
+	if how != cacheMiss {
+		e.saved = out.cost
+	}
+	e.answered(body.Provider, len(body.Results), body.ProvidersFailed)
 	return answer{body: body, cache: how, stored: stored}
 }
 
 func (s *Server) context(r *http.Request, e *entry) answer {
-	name := s.provider.Name()
+	chain := s.routes.Context
+	name := chain.Name()
 	e.provider = name
 	q := r.URL.Query()
-	query := strings.TrimSpace(q.Get("q"))
-	e.query = query
-	if query == "" {
-		return answer{err: badRequest("q is empty")}
-	}
-	if len(query) > MaxQuery {
-		return answer{err: badRequest(fmt.Sprintf("q is longer than %d bytes", MaxQuery))}
+	e.query = strings.TrimSpace(q.Get("q"))
+	query, err := queryParam(q)
+	if err != nil {
+		return answer{err: err}
 	}
 	tokens, err := intParam(q, "tokens", DefaultTokens, MinTokens, MaxTokens)
 	if err != nil {
@@ -244,35 +273,39 @@ func (s *Server) context(r *http.Request, e *entry) answer {
 	if err != nil {
 		return answer{err: err}
 	}
-	if !provider.HasContext(s.provider) {
-		_, err := provider.ContextOf(r.Context(), s.provider, provider.ContextRequest{})
-		return answer{err: err}
+	if !chain.CanContext() {
+		return answer{err: &provider.NotAvailableError{Msg: "no context provider is configured; use /v1/search and /v1/fetch"}}
 	}
 	c := s.cache
 	key := fmt.Sprintf("%s\x00%d\x00%d", searchKey(name, query, freshness), tokens, urls)
 	out, how, stored, trace, err := cachedCall(s, r, c.contexts, &c.contextCalls, key, ContextBudget,
 		func(ctx context.Context) (*Context, error) {
-			res, err := provider.ContextOf(ctx, s.provider, provider.ContextRequest{Query: query, Tokens: tokens, URLs: urls, Freshness: freshness})
+			res, by, err := chain.Context(ctx, provider.ContextRequest{Query: query, Tokens: tokens, URLs: urls, Freshness: freshness})
 			if err != nil {
 				return nil, err
 			}
-			return NewContext(query, name, res, tokens)
+			out := NewContext(query, res, by, tokens)
+			out.cost = provider.TraceOf(ctx).Cost()
+			return out, nil
 		},
-		func(v *Context) (int64, bool) { return v.size(), len(v.EnginesFailed) > 0 })
+		func(v *Context) (int64, bool) { return v.size(), len(v.ProvidersFailed) > 0 })
 	e.trace = trace
 	if err != nil {
 		return answer{err: err, cache: how}
 	}
 	body := out.slice(query)
-	e.answered(body.Provider, len(body.Sources), body.EnginesFailed)
+	if how != cacheMiss {
+		e.saved = out.cost
+	}
+	e.answered(body.Provider, len(body.Sources), body.ProvidersFailed)
 	return answer{body: body, cache: how, stored: stored}
 }
 
 // cachedCall is §8.1 for search and context: the lookup unless the request
 // sent no-cache, else one shared call per key under budget and a slot, its
-// answer stored (size and whether engines failed from measure), and an
-// expired entry answered instead of no_engines. trace is how the call got
-// its answer (§10); nil on a hit, or when this request left before it.
+// answer stored (size and whether a provider failed from measure), and an
+// expired entry answered instead of provider_unavailable. trace is how
+// the call got its answer (§10); nil on a hit.
 func cachedCall[T any](s *Server, r *http.Request, lru *cache.LRU[T], group *cache.Group[traced[T]], key string, budget time.Duration,
 	call func(context.Context) (T, error), measure func(T) (size int64, partial bool)) (v T, how string, stored time.Time, trace *provider.Trace, err error) {
 	c := s.cache
@@ -316,7 +349,7 @@ func cachedCall[T any](s *Server, r *http.Request, lru *cache.LRU[T], group *cac
 	})
 	if err != nil {
 		err = waited(ctx, err, budget)
-		if stale != nil && Classify(err).Code == "no_engines" {
+		if stale != nil && Classify(err).Code == "provider_unavailable" {
 			return stale.Value, cacheStale, stale.Stored, t.trace, nil
 		}
 		return t.v, cacheMiss, time.Time{}, t.trace, err
@@ -325,6 +358,8 @@ func cachedCall[T any](s *Server, r *http.Request, lru *cache.LRU[T], group *cac
 }
 
 func (s *Server) fetch(r *http.Request, e *entry) answer {
+	chain := s.routes.Fetch
+	e.provider = chain.Name()
 	q := r.URL.Query()
 	raw := q.Get("url")
 	e.url = raw
@@ -342,62 +377,109 @@ func (s *Server) fetch(r *http.Request, e *entry) answer {
 	if err != nil {
 		return answer{err: err}
 	}
+	focus := strings.TrimSpace(q.Get("q"))
+	e.query = focus
+	if len(focus) > MaxFocus {
+		return answer{err: badRequest(fmt.Sprintf("q is longer than %d bytes", MaxFocus))}
+	}
 	// A URL the guard refuses outright needs no slot, and never reaches
 	// the cache (§8.1).
 	u, err := fetch.Parse(raw)
 	if err != nil {
 		return answer{err: err}
 	}
+	if !chain.CanExtract() {
+		return answer{err: &provider.NotAvailableError{Msg: "no fetch provider is configured"}}
+	}
 
 	c := s.cache
-	key := fetchKey(u)
+	key := pageKey(chain.Name(), u, focus)
 	// page is one request's answer from a shared document.
-	page := func(p *fetch.Page, how string, stored time.Time) answer {
-		e.finalURL = p.FinalURL
-		own := *p
+	page := func(pe pageEntry, how string, stored time.Time) answer {
+		e.finalURL = pe.page.FinalURL
+		own := *pe.page
 		own.URL = raw
-		return answer{body: NewFetch(&own, start, maxChars), cache: how, stored: stored}
+		body := NewFetch(&own, pe.by, start, maxChars)
+		e.answered(body.Provider, 1, body.ProvidersFailed)
+		if how != cacheMiss {
+			e.saved = pe.cost
+		}
+		return answer{body: body, cache: how, stored: stored}
 	}
 	if !noCache(r) {
 		if ent, ok := c.pages.Get(key, c.now()); ok && ent.Fresh {
 			if ent.Value.err != nil {
 				return answer{err: ent.Value.err, cache: cacheHit, stored: ent.Stored}
 			}
-			return page(ent.Value.page, cacheHit, ent.Stored)
+			return page(ent.Value, cacheHit, ent.Stored)
 		}
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), fetch.Budget)
+	ctx, cancel := context.WithTimeout(r.Context(), FetchBudget)
 	defer cancel()
-	p, err := c.fetchCalls.Do(ctx, key, func(ctx context.Context) (*fetch.Page, error) {
+	ttl := FetchTTL
+	if focus != "" {
+		ttl = FocusTTL
+	}
+	t, err := c.fetchCalls.Do(ctx, key, func(ctx context.Context) (traced[pageEntry], error) {
+		t := traced[pageEntry]{trace: &provider.Trace{}}
 		release, err := s.acquire(ctx)
 		if err != nil {
-			return nil, err
+			return t, err
 		}
-		ctx, cancel := context.WithTimeout(ctx, fetch.Budget)
+		defer release()
+		ctx, cancel := context.WithTimeout(ctx, FetchBudget)
 		defer cancel()
-		// The slot is released by Fetch when all its work ends, which may
-		// be after a timed-out request has been answered (§7.1).
-		p, err := s.fetcher.Fetch(ctx, raw, release)
+		ctx = provider.WithTrace(ctx, t.trace)
+		if noCache(r) {
+			ctx = provider.WithNoCache(ctx)
+		}
+		p, by, err := chain.Extract(ctx, provider.ExtractRequest{URL: raw, Focus: focus})
 		if err != nil {
 			if code := Classify(err).Code; code == "upstream_failed" || code == "unsupported_content" {
-				c.pages.Put(key, pageEntry{err: err}, int64(entryOverhead+len(key)+len(err.Error())), c.now(), FailTTL, FailTTL)
+				pe := pageEntry{err: err}
+				c.pages.Put(key, pe, int64(len(key))+pageSize(pe), c.now(), FailTTL, FailTTL)
 			}
-			return nil, err
+			return t, err
 		}
-		c.pages.Put(key, pageEntry{page: p}, int64(len(key))+pageSize(p), c.now(), FetchTTL, FetchTTL)
-		return p, nil
+		t.v = pageEntry{page: p, by: by, cost: t.trace.Cost()}
+		c.pages.Put(key, t.v, int64(len(key))+pageSize(t.v), c.now(), ttl, ttl)
+		return t, nil
 	})
+	e.trace = t.trace
 	if err != nil {
-		return answer{err: waited(ctx, err, fetch.Budget), cache: cacheMiss}
+		return answer{err: waited(ctx, err, FetchBudget), cache: cacheMiss}
 	}
-	return page(p, cacheMiss, time.Time{})
+	return page(t.v, cacheMiss, time.Time{})
+}
+
+// endpointsOf lists what the routes answer, for §3.4's endpoints.
+func (s *Server) endpointsOf() []string {
+	var out []string
+	if s.routes.Search.CanSearch() {
+		out = append(out, "/v1/search")
+	}
+	if s.routes.Context.CanContext() {
+		out = append(out, "/v1/context")
+	}
+	if s.routes.Fetch.CanExtract() {
+		out = append(out, "/v1/fetch")
+	}
+	return out
+}
+
+func (s *Server) routeNames() map[string][]string {
+	return map[string][]string{
+		"/v1/search":  s.routes.Search.Names(),
+		"/v1/context": s.routes.Context.Names(),
+		"/v1/fetch":   s.routes.Fetch.Names(),
+	}
 }
 
 func (s *Server) health(r *http.Request) answer {
 	ctx, cancel := context.WithTimeout(r.Context(), HealthTimeout)
 	defer cancel()
-	h := Health{Version: s.version, Providers: map[string]string{}, Endpoints: []string{"/v1/search"}, Cache: s.cache.stats()}
-	for _, p := range provider.Members(s.provider) {
+	h := Health{Version: s.version, Providers: map[string]string{}, Routes: s.routeNames(), Endpoints: s.endpointsOf(), Cache: s.cache.stats()}
+	for _, p := range s.routes.Providers() {
 		state := "ok"
 		if err := p.Health(ctx); err != nil {
 			state = "down"
@@ -407,7 +489,7 @@ func (s *Server) health(r *http.Request) answer {
 			if h.Billed == nil {
 				h.Billed = map[string]int64{}
 			}
-			h.Billed[p.Name()] = b.Billed()
+			h.Billed[p.Name()] = b.Billed().Units
 		}
 		if q, ok := p.(provider.Quotaer); ok {
 			if quota, ok := q.Quota(); ok {
@@ -418,10 +500,6 @@ func (s *Server) health(r *http.Request) answer {
 			}
 		}
 	}
-	if provider.HasContext(s.provider) {
-		h.Endpoints = append(h.Endpoints, "/v1/context")
-	}
-	h.Endpoints = append(h.Endpoints, "/v1/fetch")
 	return answer{body: h}
 }
 
@@ -506,6 +584,7 @@ func write(w http.ResponseWriter, status int, body any) {
 	h := w.Header()
 	h.Set("Content-Type", "application/json; charset=utf-8")
 	h.Set("Cache-Control", "no-store")
+	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Content-Length", strconv.Itoa(buf.Len()))
 	if status == http.StatusMethodNotAllowed {
 		h.Set("Allow", http.MethodGet)
@@ -519,12 +598,12 @@ func write(w http.ResponseWriter, status int, body any) {
 // tried); ERROR for a bug; INFO otherwise, success and the client's own
 // mistakes.
 var levels = map[string]slog.Level{
-	"upstream_failed":  slog.LevelWarn,
-	"upstream_timeout": slog.LevelWarn,
-	"no_engines":       slog.LevelWarn,
-	"busy":             slog.LevelWarn,
-	"blocked_address":  slog.LevelWarn,
-	"internal":         slog.LevelError,
+	"upstream_failed":      slog.LevelWarn,
+	"upstream_timeout":     slog.LevelWarn,
+	"provider_unavailable": slog.LevelWarn,
+	"busy":                 slog.LevelWarn,
+	"blocked_address":      slog.LevelWarn,
+	"internal":             slog.LevelError,
 }
 
 // logRequest writes §10's one line per request.
@@ -552,12 +631,13 @@ func (s *Server) logRequest(r *http.Request, e *entry, d time.Duration) {
 	}
 	if e.answeredBy != "" {
 		attrs = append(attrs, slog.Int("results", e.results))
-		if len(e.enginesFailed) > 0 {
-			attrs = append(attrs, slog.String("engines_failed", strings.Join(e.enginesFailed, ",")))
+		if len(e.providersFailed) > 0 {
+			attrs = append(attrs, slog.String("providers_failed", strings.Join(e.providersFailed, ",")))
 		}
 	}
 	for _, name := range slices.Sorted(maps.Keys(e.billed)) {
-		attrs = append(attrs, slog.Int(name+"_billed", e.billed[name]))
+		b := e.billed[name]
+		attrs = append(attrs, slog.Int64(name+"_billed", b.Units), slog.String(name+"_cost_usd", usd(b.Micros)))
 	}
 	quotas := e.trace.Quotas()
 	for _, name := range slices.Sorted(maps.Keys(quotas)) {
@@ -593,4 +673,9 @@ func (s *Server) logRequest(r *http.Request, e *entry, d time.Duration) {
 		attrs = append(attrs, slog.String("detail", e.detail))
 	}
 	s.log.LogAttrs(context.Background(), level, "request", attrs...)
+}
+
+// usd formats micro-dollars as dollars with six decimals.
+func usd(micros int64) string {
+	return strconv.FormatFloat(float64(micros)/1e6, 'f', 6, 64)
 }

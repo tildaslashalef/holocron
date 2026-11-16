@@ -13,9 +13,10 @@ import (
 	"github.com/tildaslashalef/holocron/internal/fetch"
 	"github.com/tildaslashalef/holocron/internal/guard"
 	"github.com/tildaslashalef/holocron/internal/provider"
+	"github.com/tildaslashalef/holocron/internal/provider/local"
 )
 
-// The contract's bounds (§3.2, §3.3).
+// The contract's bounds (§3.2, §3.3, §3.5).
 const (
 	MaxQuery        = 400
 	DefaultN        = 8
@@ -29,50 +30,58 @@ const (
 	MaxTokens       = 16_384
 	DefaultURLs     = 8
 	MaxURLs         = 20
-	CharsPerToken   = 8 // §3.5's backstop on the snippets' total
+	MaxFocus        = 400 // §3.3's q
+	CharsPerToken   = 8   // §3.5's backstop on the snippets' total
 )
 
 // Search is §3.2's answer.
 type Search struct {
-	Query         string   `json:"query"`
-	Provider      string   `json:"provider"`
-	Results       []Result `json:"results"`
-	AlteredQuery  *string  `json:"altered_query"`
-	EnginesFailed []string `json:"engines_failed"`
+	Query           string   `json:"query"`
+	Provider        string   `json:"provider"`
+	Results         []Result `json:"results"`
+	AlteredQuery    *string  `json:"altered_query"`
+	ProvidersFailed []string `json:"providers_failed"`
+
+	cost int64 // what the call that got it cost, in micro-dollars (§8.3)
 }
 
 // Result is one search result within §3.2's bounds.
 type Result struct {
-	Title         string   `json:"title"`
-	URL           string   `json:"url"`
-	Snippet       string   `json:"snippet"`
-	Engine        string   `json:"engine"`
-	Published     *string  `json:"published"`
-	ExtraSnippets []string `json:"extra_snippets"`
+	Title     string   `json:"title"`
+	URL       string   `json:"url"`
+	Snippet   string   `json:"snippet"`
+	Snippets  []string `json:"snippets"`
+	Published *string  `json:"published"`
 }
 
-// MaxExtraSnippets bounds a result's extra_snippets (§3.2).
-const MaxExtraSnippets = 5
+// MaxSnippets bounds a result's snippets (§3.2).
+const MaxSnippets = 5
 
 // Fetch is §3.3's answer.
 type Fetch struct {
-	URL         string `json:"url"`
-	FinalURL    string `json:"final_url"`
-	Status      int    `json:"status"`
-	ContentType string `json:"content_type"`
-	Title       string `json:"title"`
-	Text        string `json:"text"`
-	Start       int    `json:"start"`
-	Chars       int    `json:"chars"`
-	Truncated   bool   `json:"truncated"`
+	URL             string   `json:"url"`
+	FinalURL        string   `json:"final_url"`
+	Provider        string   `json:"provider"`
+	ProvidersFailed []string `json:"providers_failed"`
+	Status          *int     `json:"status"`
+	ContentType     *string  `json:"content_type"`
+	Title           string   `json:"title"`
+	Published       *string  `json:"published"`
+	Focused         bool     `json:"focused"`
+	Text            string   `json:"text"`
+	Start           int      `json:"start"`
+	Chars           int      `json:"chars"`
+	Truncated       bool     `json:"truncated"`
 }
 
 // Context is §3.5's answer.
 type Context struct {
-	Query         string   `json:"query"`
-	Provider      string   `json:"provider"`
-	Sources       []Source `json:"sources"`
-	EnginesFailed []string `json:"engines_failed"`
+	Query           string   `json:"query"`
+	Provider        string   `json:"provider"`
+	Sources         []Source `json:"sources"`
+	ProvidersFailed []string `json:"providers_failed"`
+
+	cost int64
 }
 
 // Source is one page's passages within §3.5's bounds.
@@ -87,6 +96,7 @@ type Source struct {
 type Health struct {
 	Version   string                `json:"version"`
 	Providers map[string]string     `json:"providers"`
+	Routes    map[string][]string   `json:"routes"`
 	Endpoints []string              `json:"endpoints"`
 	Billed    map[string]int64      `json:"billed,omitempty"`
 	Quota     map[string]QuotaStats `json:"quota,omitempty"`
@@ -134,6 +144,7 @@ func Classify(err error) *Error {
 		unavailable *provider.UnavailableError
 		badQuery    *provider.BadQueryError
 		notAvail    *provider.NotAvailableError
+		busy        *local.BusyError
 	)
 	switch {
 	case errors.As(err, &apiErr):
@@ -151,26 +162,21 @@ func Classify(err error) *Error {
 	case errors.As(err, &provTime):
 		return &Error{"upstream_timeout", http.StatusGatewayTimeout, provTime.Msg}
 	case errors.As(err, &unavailable):
-		return &Error{"no_engines", http.StatusServiceUnavailable, unavailable.Msg}
+		return &Error{"provider_unavailable", http.StatusServiceUnavailable, unavailable.Msg}
 	case errors.As(err, &badQuery):
 		return badRequest(badQuery.Msg)
 	case errors.As(err, &notAvail):
 		return &Error{"not_available", http.StatusNotImplemented, notAvail.Msg}
+	case errors.As(err, &busy):
+		return &Error{"busy", http.StatusServiceUnavailable, busy.Msg}
 	}
 	return &Error{"internal", http.StatusInternalServerError, "a bug in holocron; the log has the detail"}
 }
 
 // NewSearch applies §3.2's bounds to a provider's answer: http(s) URLs
-// only, deduplicated, at most n, titles and snippets clipped. No results
-// while engines failed is no_engines.
-func NewSearch(query, providerName string, res provider.Results, n int) (*Search, error) {
-	if res.Provider != "" {
-		providerName = res.Provider
-	}
-	out := &Search{Query: query, Provider: providerName, Results: []Result{}, EnginesFailed: []string{}}
-	if res.EnginesFailed != nil {
-		out.EnginesFailed = res.EnginesFailed
-	}
+// only, deduplicated, at most n, titles and snippets clipped.
+func NewSearch(query string, res provider.Results, by provider.Answered, n int) *Search {
+	out := &Search{Query: query, Provider: by.Provider, Results: []Result{}, ProvidersFailed: failed(by)}
 	if res.AlteredQuery != "" {
 		a := res.AlteredQuery
 		out.AlteredQuery = &a
@@ -180,75 +186,45 @@ func NewSearch(query, providerName string, res provider.Results, n int) (*Search
 		if len(out.Results) == n {
 			break
 		}
-		u, err := url.Parse(strings.TrimSpace(it.URL))
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-			continue
-		}
-		key := u.String()
-		if seen[key] {
+		key, ok := httpURL(it.URL)
+		if !ok || seen[key] {
 			continue
 		}
 		seen[key] = true
 		r := Result{
-			Title:   extract.Clip(collapse(it.Title), MaxTitle),
-			URL:     key,
-			Snippet: extract.Clip(collapse(it.Snippet), MaxSnippet),
-			Engine:  it.Engine,
+			Title:     extract.Clip(collapse(it.Title), MaxTitle),
+			URL:       key,
+			Snippet:   extract.Clip(collapse(it.Snippet), MaxSnippet),
+			Snippets:  []string{},
+			Published: date(it.Published),
 		}
-		r.ExtraSnippets = []string{}
-		for _, e := range it.ExtraSnippets {
-			if e = extract.Clip(collapse(e), MaxSnippet); e != "" && len(r.ExtraSnippets) < MaxExtraSnippets {
-				r.ExtraSnippets = append(r.ExtraSnippets, e)
+		for _, e := range it.Snippets {
+			if e = extract.Clip(collapse(e), MaxSnippet); e != "" && e != r.Snippet && len(r.Snippets) < MaxSnippets {
+				r.Snippets = append(r.Snippets, e)
 			}
-		}
-		if r.Engine == "" {
-			r.Engine = providerName
-		}
-		if it.Published != "" {
-			p := it.Published
-			r.Published = &p
 		}
 		out.Results = append(out.Results, r)
 	}
-	if len(out.Results) == 0 && len(out.EnginesFailed) > 0 {
-		return nil, &Error{"no_engines", http.StatusServiceUnavailable,
-			"no results, and these engines failed: " + strings.Join(out.EnginesFailed, ", ")}
-	}
-	return out, nil
+	return out
 }
 
 // NewContext applies §3.5's bounds to a provider's answer: http(s) URLs
 // only, deduplicated, titles clipped, the snippets' total cut at
-// CharsPerToken × tokens characters. No sources while engines failed is
-// no_engines.
-func NewContext(query, providerName string, res provider.Context, tokens int) (*Context, error) {
-	if res.Provider != "" {
-		providerName = res.Provider
-	}
-	out := &Context{Query: query, Provider: providerName, Sources: []Source{}, EnginesFailed: []string{}}
-	if res.EnginesFailed != nil {
-		out.EnginesFailed = res.EnginesFailed
-	}
+// CharsPerToken × tokens characters.
+func NewContext(query string, res provider.Context, by provider.Answered, tokens int) *Context {
+	out := &Context{Query: query, Provider: by.Provider, Sources: []Source{}, ProvidersFailed: failed(by)}
 	budget := CharsPerToken * tokens
 	seen := map[string]bool{}
 	for _, it := range res.Sources {
 		if budget <= 0 {
 			break
 		}
-		u, err := url.Parse(strings.TrimSpace(it.URL))
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-			continue
-		}
-		key := u.String()
-		if seen[key] {
+		key, ok := httpURL(it.URL)
+		if !ok || seen[key] {
 			continue
 		}
 		seen[key] = true
-		src := Source{URL: key, Title: extract.Clip(collapse(it.Title), MaxTitle), Snippets: []string{}}
-		if it.Published != "" {
-			p := it.Published
-			src.Published = &p
-		}
+		src := Source{URL: key, Title: extract.Clip(collapse(it.Title), MaxTitle), Published: date(it.Published), Snippets: []string{}}
 		for _, sn := range it.Snippets {
 			if budget <= 0 {
 				break
@@ -261,28 +237,59 @@ func NewContext(query, providerName string, res provider.Context, tokens int) (*
 		}
 		out.Sources = append(out.Sources, src)
 	}
-	if len(out.Sources) == 0 && len(out.EnginesFailed) > 0 {
-		return nil, &Error{"no_engines", http.StatusServiceUnavailable,
-			"no sources, and these engines failed: " + strings.Join(out.EnginesFailed, ", ")}
-	}
-	return out, nil
+	return out
 }
 
-// NewFetch pages a fetched document: maxChars characters from start,
+// NewFetch pages an extracted document: maxChars characters from start,
 // counted in code points.
-func NewFetch(p *fetch.Page, start, maxChars int) *Fetch {
+func NewFetch(p *provider.Page, by provider.Answered, start, maxChars int) *Fetch {
 	text, chars := window(p.Text, start, maxChars)
-	return &Fetch{
-		URL:         p.URL,
-		FinalURL:    p.FinalURL,
-		Status:      p.Status,
-		ContentType: p.ContentType,
-		Title:       p.Title,
-		Text:        text,
-		Start:       start,
-		Chars:       chars,
-		Truncated:   p.Truncated || start+utf8.RuneCountInString(text) < chars,
+	f := &Fetch{
+		URL:             p.URL,
+		FinalURL:        p.FinalURL,
+		Provider:        by.Provider,
+		ProvidersFailed: failed(by),
+		Title:           extract.Clip(collapse(p.Title), MaxTitle),
+		Published:       date(p.Published),
+		Focused:         p.Focused,
+		Text:            text,
+		Start:           start,
+		Chars:           chars,
+		Truncated:       p.Truncated || start+utf8.RuneCountInString(text) < chars,
 	}
+	if p.Status != 0 {
+		s := p.Status
+		f.Status = &s
+	}
+	if p.ContentType != "" {
+		ct := p.ContentType
+		f.ContentType = &ct
+	}
+	return f
+}
+
+func failed(by provider.Answered) []string {
+	if by.Failed == nil {
+		return []string{}
+	}
+	return by.Failed
+}
+
+// httpURL is raw normalized when it is an absolute http(s) URL.
+func httpURL(raw string) (string, bool) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+		return "", false
+	}
+	return u.String(), true
+}
+
+// date is a pointer to an ISO date, or nil for "".
+func date(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }
 
 // window returns at most n code points of s from code point start, and the

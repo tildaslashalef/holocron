@@ -216,3 +216,27 @@ func TestDialerDeadline(t *testing.T) {
 		t.Errorf("lookup took %v past a 100ms deadline", d)
 	}
 }
+
+// CheckHost refuses a name unless every address it resolves to is public;
+// a literal is left to CheckURL.
+func TestCheckHost(t *testing.T) {
+	r := guardtest.Resolver(map[string][]string{
+		"public.example": {"93.184.216.34"},
+		"mixed.example":  {"93.184.216.34", "10.0.0.5"},
+		"lan.example":    {"192.168.1.1"},
+		"v6.example":     {"fd00::1"},
+	})
+	for host, blocked := range map[string]bool{
+		"public.example": false, "PUBLIC.example.": false, "mixed.example": true, "lan.example": true, "v6.example": true,
+		"192.168.1.1": false, // a literal: CheckURL's
+	} {
+		err := CheckHost(context.Background(), r, &url.URL{Scheme: "https", Host: host})
+		_, isBlocked := errors.AsType[*BlockedError](err)
+		if isBlocked != blocked || !blocked && err != nil {
+			t.Errorf("%s: %v, want blocked %v", host, err, blocked)
+		}
+	}
+	if err := CheckHost(context.Background(), r, &url.URL{Scheme: "https", Host: "missing.example"}); err == nil {
+		t.Error("a name that does not resolve passed")
+	}
+}

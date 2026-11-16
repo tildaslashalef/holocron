@@ -1,6 +1,7 @@
-// Package provider is the search provider interface (SPEC.md §5) and the
-// chaining of several providers (§5.3). The HTTP layer applies §3.2's and
-// §3.5's bounds to every provider's answers.
+// Package provider is the provider interfaces (SPEC.md §5), the chaining
+// of several providers per endpoint (§5.4), and what a request records of
+// how it was answered (§10). The HTTP layer applies §3's bounds to every
+// provider's answers.
 package provider
 
 import (
@@ -8,6 +9,14 @@ import (
 	"sync"
 	"time"
 )
+
+// Provider is a backend: a search API, an extraction API, or holocron's
+// own fetcher. What it can answer is the capability interfaces it also
+// implements: Searcher, Contexter, Extractor.
+type Provider interface {
+	Name() string
+	Health(ctx context.Context) error
+}
 
 // SearchRequest is one §3.2 request, its bounds applied.
 type SearchRequest struct {
@@ -18,30 +27,24 @@ type SearchRequest struct {
 
 // Result is one search result as the provider gave it.
 type Result struct {
-	Title         string
-	URL           string
-	Snippet       string
-	ExtraSnippets []string
-	Engine        string
-	Published     string // an ISO date, or ""
+	Title     string
+	URL       string
+	Snippet   string
+	Snippets  []string // more passages from the page
+	Published string   // an ISO date, or ""
 }
 
-// Results is one answer: the items in the provider's rank order, the
-// provider that answered ("" for the one asked), the query it searched
-// when it corrected this one ("" when it did not), and the engines that
-// failed for this query.
+// Results is one search answer: the items in the provider's rank order,
+// and the query it searched when it corrected this one ("" when it did
+// not).
 type Results struct {
-	Items         []Result
-	Provider      string
-	AlteredQuery  string
-	EnginesFailed []string
+	Items        []Result
+	AlteredQuery string
 }
 
-// Provider is a search backend.
-type Provider interface {
-	Name() string
+// Searcher is a provider of /v1/search.
+type Searcher interface {
 	Search(ctx context.Context, r SearchRequest) (Results, error)
-	Health(ctx context.Context) error
 }
 
 // ContextRequest is one §3.5 request, its bounds applied.
@@ -60,16 +63,40 @@ type Source struct {
 	Snippets  []string
 }
 
-// Context is one §3.5 answer, as Results is for a search.
+// Context is one §3.5 answer.
 type Context struct {
-	Sources       []Source
-	Provider      string
-	EnginesFailed []string
+	Sources []Source
 }
 
-// Contexter is a provider with context (§3.5).
+// Contexter is a provider of /v1/context.
 type Contexter interface {
 	Context(ctx context.Context, r ContextRequest) (Context, error)
+}
+
+// ExtractRequest is one §3.3 request: a URL that passed the guard's step
+// 1, and the question its text should answer ("" for the whole page).
+type ExtractRequest struct {
+	URL   string
+	Focus string
+}
+
+// Page is one extracted document. Status and ContentType are 0 and ""
+// when the provider does not report them (an extraction API).
+type Page struct {
+	URL         string
+	FinalURL    string
+	Status      int
+	ContentType string // the media type alone, e.g. "text/html"
+	Title       string
+	Published   string // an ISO date, or ""
+	Text        string
+	Focused     bool // Text is the parts relevant to the request's Focus
+	Truncated   bool // the source was cut before extraction
+}
+
+// Extractor is a provider of /v1/fetch.
+type Extractor interface {
+	Extract(ctx context.Context, r ExtractRequest) (*Page, error)
 }
 
 // Quota is a metered provider's remaining requests (§3.4).
@@ -84,15 +111,32 @@ type Quotaer interface {
 	Quota() (q Quota, ok bool)
 }
 
-// Biller is a metered provider that counts its billed requests (its
-// successful answers) since the process started (§3.4).
-type Biller interface {
-	Billed() int64
+// Bill is what a provider charged, as far as holocron can count it: the
+// billed units (requests, or URLs for an extraction) and their estimated
+// cost in millionths of a US dollar, from §5's price table.
+type Bill struct {
+	Units  int64
+	Micros int64
 }
 
-// UnavailableError is a provider that cannot answer: unreachable, or every
-// engine failed (no_engines). Reason is §10's category when the provider
-// knows it: quota, key_refused, rate_limited; "" is error.
+// Add returns b with o added.
+func (b Bill) Add(o Bill) Bill { return Bill{b.Units + o.Units, b.Micros + o.Micros} }
+
+// Biller is a metered provider: what it billed since the process started.
+type Biller interface {
+	Billed() Bill
+}
+
+// Budgeter is a provider that gets at most a share (0 to 1) of the
+// request's remaining budget when another member follows it, so that one
+// is still asked in time (§5.4).
+type Budgeter interface {
+	BudgetShare() float64
+}
+
+// UnavailableError is a provider that cannot answer: unreachable, held
+// back, failing (provider_unavailable). Reason is §10's category: quota,
+// key_refused, rate_limited, timeout; "" is error.
 type UnavailableError struct {
 	Msg    string
 	Reason string
@@ -121,7 +165,8 @@ const (
 	ReasonQuota       = "quota"
 	ReasonKeyRefused  = "key_refused"
 	ReasonRateLimited = "rate_limited"
-	ReasonNoResults   = "no_results"
+	ReasonTimeout     = "timeout"
+	ReasonUnreadable  = "unreadable" // a page the provider could not read
 	ReasonError       = "error"
 )
 
@@ -131,29 +176,29 @@ type Fallback struct {
 	Reason   string
 }
 
-// Trace collects how one request was answered, for its log line (§10):
-// the providers a chain moved past, and each metered provider's quota
-// after its answer. It is safe for concurrent use; a nil *Trace ignores
-// everything.
+// Trace collects how one call was answered, for its log line (§10): the
+// providers a chain moved past, each metered provider's quota after its
+// answer, and what each billed. It is safe for concurrent use; a nil
+// *Trace ignores everything.
 type Trace struct {
 	mu        sync.Mutex
 	fallbacks []Fallback
 	quotas    map[string]Quota
-	billed    map[string]int
+	billed    map[string]Bill
 	claimed   bool
 }
 
-// Bill records one billed request to provider.
-func (t *Trace) Bill(provider string) {
+// Bill records what provider billed for this call.
+func (t *Trace) Bill(provider string, b Bill) {
 	if t == nil {
 		return
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.billed == nil {
-		t.billed = map[string]int{}
+		t.billed = map[string]Bill{}
 	}
-	t.billed[provider]++
+	t.billed[provider] = t.billed[provider].Add(b)
 }
 
 // Claim reports true to its first caller only: of the requests sharing one
@@ -170,18 +215,27 @@ func (t *Trace) Claim() bool {
 	return first
 }
 
-// Billed returns the billed requests by provider.
-func (t *Trace) Billed() map[string]int {
+// Billed returns what each provider billed.
+func (t *Trace) Billed() map[string]Bill {
 	if t == nil {
 		return nil
 	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	out := make(map[string]int, len(t.billed))
+	out := make(map[string]Bill, len(t.billed))
 	for k, v := range t.billed {
 		out[k] = v
 	}
 	return out
+}
+
+// Cost is the call's estimated cost in micro-dollars, all providers.
+func (t *Trace) Cost() int64 {
+	var n int64
+	for _, b := range t.Billed() {
+		n += b.Micros
+	}
+	return n
 }
 
 // Fallback records that the chain moved past provider for reason.
@@ -247,7 +301,7 @@ func TraceOf(ctx context.Context) *Trace {
 type noCacheKey struct{}
 
 // WithNoCache marks ctx as a request that asked for Cache-Control:
-// no-cache, for a provider that has a cache of its own (§5.2).
+// no-cache, for a provider that has a cache of its own (§8.1).
 func WithNoCache(ctx context.Context) context.Context {
 	return context.WithValue(ctx, noCacheKey{}, true)
 }
